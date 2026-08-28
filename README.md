@@ -71,7 +71,9 @@ cargo test
 
 Benchmarks (via [criterion](https://docs.rs/criterion)) compare `rearcut`
 against [`lyon_tessellation`](https://docs.rs/lyon_tessellation)'s
-`FillTessellator` on the same inputs:
+`FillTessellator` and against [`earcut`](https://crates.io/crates/earcut)
+(the [georust/earcut](https://github.com/georust/earcut) crate, another
+independent Rust port of mapbox/earcut) on the same inputs:
 
 - **`fixtures`** — a subset of the real-world earcut fixtures (buildings,
   hand-drawn shapes, water polygons of increasing size/hole count).
@@ -103,36 +105,48 @@ cargo bench --features earcut-hpp
 (Ryzen-class x86_64, `cargo bench`, single run — see the HTML report for full
 distributions; absolute numbers vary by machine, relative shape is the point)
 
-| Benchmark              | rearcut    | lyon (FillTessellator) | earcut.hpp (C++) |
-|-------------------------|-----------:|------------------------:|------------------:|
-| `fixtures/building` (13 tris) | 0.34 µs | 1.4 µs  | 0.26 µs |
-| `fixtures/dude` (106 tris)    | 5.7 µs  | 8.6 µs  | 4.2 µs |
-| `fixtures/bad-hole` (37 tris) | 3.0 µs  | 4.4 µs  | 2.3 µs |
-| `fixtures/water` (2482 tris)  | 245 µs  | 545 µs  | 167 µs |
-| `fixtures/water-huge` (5174 tris, 192 holes) | 1.75 ms | 1.2 ms | 1.45 ms |
-| `fixtures/water-huge3` (15470 tris, 1443 holes) | 25.7 ms | 5.0 ms | 21.4 ms |
-| `star/16` points        | 0.96 µs    | 3.7 µs | 0.6 µs |
-| `star/4096` points      | 16.5 ms    | 41 ms  | 15.1 ms |
-| `star/65536` points     | 4.6 s      | 10.1 s | 4.3 s |
-| `holes/64` (8×8 grid)   | 69 µs      | 27 µs  | 43 µs |
-| `holes/1024` (32×32 grid) | 11.2 ms  | 0.69 ms | 7.4 ms |
+| Benchmark              | rearcut    | earcut-rs (georust) | lyon (FillTessellator) | earcut.hpp (C++) |
+|-------------------------|-----------:|---------------------:|------------------------:|------------------:|
+| `fixtures/building` (13 tris) | 0.33 µs | 0.20 µs | 1.6 µs  | 0.25 µs |
+| `fixtures/dude` (106 tris)    | 5.7 µs  | 4.7 µs  | 8.6 µs  | 4.1 µs |
+| `fixtures/bad-hole` (37 tris) | 3.0 µs  | 2.3 µs  | 4.5 µs  | 2.3 µs |
+| `fixtures/water` (2482 tris)  | 248 µs  | 200 µs  | 542 µs  | 203 µs |
+| `fixtures/water-huge` (5174 tris, 192 holes) | 1.80 ms | 1.39 ms | 1.23 ms | 1.46 ms |
+| `fixtures/water-huge3` (15470 tris, 1443 holes) | 26.1 ms | 19.4 ms | 5.2 ms | 22.0 ms |
+| `star/16` points        | 0.99 µs    | 0.70 µs | 3.8 µs | 0.6 µs |
+| `star/4096` points      | 16.6 ms    | 13.0 ms | 41 ms  | 14.8 ms |
+| `star/65536` points     | 4.6 s      | 3.4 s   | 9.9 s  | 4.3 s |
+| `holes/64` (8×8 grid)   | 66 µs      | 50 µs   | 27 µs  | 44 µs |
+| `holes/1024` (32×32 grid) | 11.3 ms  | 8.0 ms  | 0.68 ms | 7.5 ms |
 
 **Takeaway:** for simple-to-moderately-complex polygons, and especially for
 concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
 is consistently 2–4x faster than lyon's sweep-line tessellator, and now that
 it ports the same block-bbox hole-bridge index as `earcut.hpp`, it also
 tracks the native C++ reference closely on real many-holes polygons —
-`fixtures/water-huge3` dropped from 95 ms (classic linear scan) to 25.7 ms
-after the port, versus `earcut.hpp`'s 21.4 ms (the remaining gap is mostly
+`fixtures/water-huge3` dropped from 95 ms (classic linear scan) to 26.1 ms
+after the port, versus `earcut.hpp`'s 22.0 ms (the remaining gap is mostly
 the safe arena's index indirection vs raw pointers, and Rust vs. GCC/Clang
 codegen). The one case where the block index doesn't pay off is the
 synthetic `holes` benchmark: its holes are tiny 4-vertex squares, well under
 the 16-edge block granularity, so each hole gets its own block and the
 per-block bookkeeping is pure overhead rather than a real skip — `earcut.hpp`
-shows the same effect there (43 µs / 7.4 ms), and lyon's sweep-line approach
+shows the same effect there (44 µs / 7.5 ms), and lyon's sweep-line approach
 is fastest of all on this shape of workload. In short: the block index is a
 genuine win for realistic hole-heavy polygons (many vertices per hole), and
 roughly neutral-to-slightly-negative for degenerate microscopic-hole grids.
+
+**Honest note on `earcut-rs`:** the [georust/earcut](https://github.com/georust/earcut)
+crate is, at the time of writing, consistently the fastest of the four across
+nearly every benchmark here — often beating even `earcut.hpp` (its README
+reports the same result against the C++ reference). It uses a very similar
+arena-of-nodes design to `rearcut`, but goes further: packed `Node` fields
+(vertex index and Steiner-point flag share a `u32` via a bit flag), byte
+offsets instead of element indices for node links (avoiding a multiply on
+every dereference), and pre-sized buffers reused across calls via a stateful
+`Earcut` struct. `rearcut` remains a solid, simple, from-scratch port with
+its own optimizations (see below), but if raw throughput is the only
+priority, `earcut-rs` is worth a look.
 
 The arena's internal node links (`prev`/`next`/`prev_z`/`next_z`) are stored
 as `u32` rather than `usize`, shrinking each `Node` from 64 to 48 bytes

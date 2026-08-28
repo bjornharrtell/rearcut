@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 lyon = "1.0"
+earcut = "0.4.11"
 
 [features]
 # Compiles and links the vendored mapbox/earcut.hpp (via cpp/earcut_ffi.cpp) so the

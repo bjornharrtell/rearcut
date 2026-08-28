@@ -10,6 +10,7 @@
 //! HTML report: `target/criterion/report/index.html`
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use earcut::Earcut as GeorustEarcut;
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
@@ -120,6 +121,22 @@ fn rearcut_triangulate(rings: &[Vec<[f64; 2]>]) -> usize {
     triangles.len()
 }
 
+fn georust_earcut_triangulate(rings: &[Vec<[f64; 2]>]) -> usize {
+    let mut hole_indices: Vec<u32> = Vec::with_capacity(rings.len().saturating_sub(1));
+    let mut count = 0u32;
+    for (i, ring) in rings.iter().enumerate() {
+        if i > 0 {
+            hole_indices.push(count);
+        }
+        count += ring.len() as u32;
+    }
+    let data = rings.iter().flatten().copied();
+    let mut earcut = GeorustEarcut::new();
+    let mut triangles: Vec<u32> = Vec::new();
+    earcut.earcut(data, &hole_indices, &mut triangles);
+    triangles.len()
+}
+
 fn lyon_triangulate(rings: &[Vec<[f64; 2]>]) -> usize {
     let mut builder = Path::builder();
     for ring in rings {
@@ -171,6 +188,9 @@ fn bench_fixtures(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("rearcut", name), &rings, |b, rings| {
             b.iter(|| black_box(rearcut_triangulate(black_box(rings))));
         });
+        group.bench_with_input(BenchmarkId::new("earcut-rs", name), &rings, |b, rings| {
+            b.iter(|| black_box(georust_earcut_triangulate(black_box(rings))));
+        });
         group.bench_with_input(BenchmarkId::new("lyon", name), &rings, |b, rings| {
             b.iter(|| black_box(lyon_triangulate(black_box(rings))));
         });
@@ -203,6 +223,9 @@ fn bench_stars(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("rearcut", points), &rings, |b, rings| {
             b.iter(|| black_box(rearcut_triangulate(black_box(rings))));
+        });
+        group.bench_with_input(BenchmarkId::new("earcut-rs", points), &rings, |b, rings| {
+            b.iter(|| black_box(georust_earcut_triangulate(black_box(rings))));
         });
         group.bench_with_input(BenchmarkId::new("lyon", points), &rings, |b, rings| {
             b.iter(|| black_box(lyon_triangulate(black_box(rings))));
@@ -240,6 +263,13 @@ fn bench_holes(c: &mut Criterion) {
             &rings,
             |b, rings| {
                 b.iter(|| black_box(rearcut_triangulate(black_box(rings))));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("earcut-rs", hole_count),
+            &rings,
+            |b, rings| {
+                b.iter(|| black_box(georust_earcut_triangulate(black_box(rings))));
             },
         );
         group.bench_with_input(BenchmarkId::new("lyon", hole_count), &rings, |b, rings| {
