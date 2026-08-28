@@ -35,7 +35,7 @@
 use std::fmt::Debug;
 
 /// Sentinel used for arena-relative "null" links (there's no node at this index).
-const NULL: usize = usize::MAX;
+const NULL: u32 = u32::MAX;
 
 /// A trait implemented for the integer types usable as output triangle indices.
 ///
@@ -73,13 +73,13 @@ struct Node {
     x: f64,
     y: f64,
     /// previous and next vertex nodes in a polygon ring
-    prev: usize,
-    next: usize,
+    prev: u32,
+    next: u32,
     /// z-order curve value
     z: i32,
     /// previous and next nodes in z-order (NULL if none)
-    prev_z: usize,
-    next_z: usize,
+    prev_z: u32,
+    next_z: u32,
     /// whether this is a steiner point (single-vertex hole)
     steiner: bool,
 }
@@ -124,8 +124,8 @@ struct Arena {
     /// append (not ring) order, so the chosen bridge can differ from the un-indexed scan — a
     /// different but equally valid result.
     block_bbox: Vec<f64>,
-    block_head: Vec<usize>,
-    block_stop: Vec<usize>,
+    block_head: Vec<u32>,
+    block_stop: Vec<u32>,
     num_blocks: usize,
     /// true only while `eliminate_holes` merges holes, so `remove_node` keeps the block
     /// index live (via `grow_block`)
@@ -146,23 +146,33 @@ impl Arena {
     }
 
     #[inline]
-    fn create_node(&mut self, i: usize, x: f64, y: f64) -> usize {
+    fn create_node(&mut self, i: usize, x: f64, y: f64) -> u32 {
         self.nodes.push(Node::new(i, x, y));
-        self.nodes.len() - 1
+        (self.nodes.len() - 1) as u32
     }
 
-    #[inline]
-    fn get(&self, idx: usize) -> &Node {
-        &self.nodes[idx]
+    #[inline(always)]
+    fn get(&self, idx: u32) -> &Node {
+        let idx = idx as usize;
+        debug_assert!(idx < self.nodes.len(), "arena index out of bounds");
+        // Safety: every index handled by this arena is either `NULL` (checked by callers
+        // before dereferencing) or was returned by `create_node`/`insert_node`, which only
+        // ever grows `nodes` and is never removed from the backing `Vec` (nodes are unlinked
+        // from the doubly linked list, not deallocated) — so any non-`NULL` index passed here
+        // is always in bounds.
+        unsafe { self.nodes.get_unchecked(idx) }
     }
 
-    #[inline]
-    fn get_mut(&mut self, idx: usize) -> &mut Node {
-        &mut self.nodes[idx]
+    #[inline(always)]
+    fn get_mut(&mut self, idx: u32) -> &mut Node {
+        let idx = idx as usize;
+        debug_assert!(idx < self.nodes.len(), "arena index out of bounds");
+        // Safety: see `get`.
+        unsafe { self.nodes.get_unchecked_mut(idx) }
     }
 
     /// create a node and optionally link it with previous one (in a circular doubly linked list)
-    fn insert_node(&mut self, i: usize, x: f64, y: f64, last: usize) -> usize {
+    fn insert_node(&mut self, i: usize, x: f64, y: f64, last: u32) -> u32 {
         let p = self.create_node(i, x, y);
 
         if last == NULL {
@@ -178,7 +188,7 @@ impl Arena {
         p
     }
 
-    fn remove_node(&mut self, p: usize) {
+    fn remove_node(&mut self, p: u32) {
         let (prev, next, prev_z, next_z) = {
             let n = self.get(p);
             (n.prev, n.next, n.prev_z, n.next_z)
@@ -218,7 +228,7 @@ impl Arena {
     /// index the ring run `head..stop` (exclusive) as `ceil(len / BLOCK_SIZE)` blocks; `head
     /// == stop` means the whole ring. Each block's bbox covers both endpoints of every edge it
     /// owns.
-    fn index_segment(&mut self, head: usize, stop: usize) {
+    fn index_segment(&mut self, head: u32, stop: u32) {
         let mut p = head;
         loop {
             let b = self.num_blocks;
@@ -261,7 +271,7 @@ impl Arena {
     /// them), the healed edge can extend past head's frozen block bbox if its old far
     /// endpoint lived in another block; grow head's block bbox to cover tail so the
     /// leftward-ray prune can't false-skip it.
-    fn grow_block(&mut self, head: usize, tail: usize) {
+    fn grow_block(&mut self, head: u32, tail: u32) {
         let g = self.get(head).z as usize * 4;
         let (tx, ty) = (self.get(tail).x, self.get(tail).y);
         if tx < self.block_bbox[g] {
@@ -283,7 +293,7 @@ impl Arena {
     /// node. For the single full-ring seed block (`head == stop`) the same forward advance
     /// keeps them equal, so the loop still laps the whole ring instead of collapsing to an
     /// empty walk.
-    fn live_block_head(&mut self, b: usize) -> usize {
+    fn live_block_head(&mut self, b: usize) -> u32 {
         let mut head = self.block_head[b];
         while self.get(self.get(head).prev).next != head {
             head = self.get(head).next;
@@ -292,7 +302,7 @@ impl Arena {
         head
     }
 
-    fn live_block_stop(&mut self, b: usize) -> usize {
+    fn live_block_stop(&mut self, b: usize) -> u32 {
         let mut stop = self.block_stop[b];
         while self.get(self.get(stop).prev).next != stop {
             stop = self.get(stop).next;
@@ -302,7 +312,7 @@ impl Arena {
     }
 
     #[inline]
-    fn equals(&self, p1: usize, p2: usize) -> bool {
+    fn equals(&self, p1: u32, p2: u32) -> bool {
         let a = self.get(p1);
         let b = self.get(p2);
         a.x == b.x && a.y == b.y
@@ -310,7 +320,7 @@ impl Arena {
 
     /// signed area of a triangle
     #[inline]
-    fn area(&self, p: usize, q: usize, r: usize) -> f64 {
+    fn area(&self, p: u32, q: u32, r: u32) -> f64 {
         let p = self.get(p);
         let q = self.get(q);
         let r = self.get(r);
@@ -345,6 +355,11 @@ pub fn earcut_into<N: EarcutIndex>(
     if data.is_empty() || dim == 0 {
         return;
     }
+
+    // A simple polygon with `n` vertices produces at most `n - 2` triangles;
+    // reserving up front avoids repeated reallocation as triangles are pushed.
+    let n_estimate = data.len() / dim;
+    triangles.reserve(n_estimate.saturating_sub(2) * 3);
 
     let has_holes = !hole_indices.is_empty();
     let outer_len = if has_holes {
@@ -417,7 +432,7 @@ fn linked_list(
     end: usize,
     dim: usize,
     clockwise: bool,
-) -> Option<usize> {
+) -> Option<u32> {
     let mut last = NULL;
 
     if clockwise == (signed_area(data, start, end, dim) > 0.0) {
@@ -454,7 +469,7 @@ fn linked_list(
 /// `end == None` we sweep the whole ring, lapping until nothing is removable (the fixpoint
 /// the clipper needs). With an explicit `end` we heal only the dirty window around a
 /// bridge/diagonal cut, stopping at `end` rather than lapping.
-fn filter_points(arena: &mut Arena, start: usize, end: Option<usize>) -> usize {
+fn filter_points(arena: &mut Arena, start: u32, end: Option<u32>) -> u32 {
     let full = end.is_none();
     let mut end = end.unwrap_or(start);
 
@@ -490,7 +505,7 @@ fn filter_points(arena: &mut Arena, start: usize, end: Option<usize>) -> usize {
 /// main ear slicing loop which triangulates a polygon (given as a linked list)
 fn earcut_linked<N: EarcutIndex>(
     arena: &mut Arena,
-    mut ear: usize,
+    mut ear: u32,
     triangles: &mut Vec<N>,
     min_x: f64,
     min_y: f64,
@@ -564,7 +579,7 @@ fn earcut_linked<N: EarcutIndex>(
 }
 
 /// check whether a polygon node forms a valid ear with adjacent nodes
-fn is_ear(arena: &Arena, ear: usize) -> bool {
+fn is_ear(arena: &Arena, ear: u32) -> bool {
     let a = arena.get(ear).prev;
     let b = ear;
     let c = arena.get(ear).next;
@@ -597,7 +612,7 @@ fn is_ear(arena: &Arena, ear: usize) -> bool {
     true
 }
 
-fn is_ear_hashed(arena: &Arena, ear: usize, min_x: f64, min_y: f64, inv_size: f64) -> bool {
+fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64) -> bool {
     let a = arena.get(ear).prev;
     let b = ear;
     let c = arena.get(ear).next;
@@ -656,9 +671,9 @@ fn is_ear_hashed(arena: &Arena, ear: usize, min_x: f64, min_y: f64, inv_size: f6
 /// go through all polygon nodes and cure small local self-intersections
 fn cure_local_intersections<N: EarcutIndex>(
     arena: &mut Arena,
-    start: usize,
+    start: u32,
     triangles: &mut Vec<N>,
-) -> usize {
+) -> u32 {
     let mut p = start;
     let mut start = start;
     let mut cured = false;
@@ -698,7 +713,7 @@ fn cure_local_intersections<N: EarcutIndex>(
 /// try splitting polygon into two and triangulate them independently
 fn split_earcut<N: EarcutIndex>(
     arena: &mut Arena,
-    start: usize,
+    start: u32,
     triangles: &mut Vec<N>,
     min_x: f64,
     min_y: f64,
@@ -734,10 +749,10 @@ fn eliminate_holes(
     arena: &mut Arena,
     data: &[f64],
     hole_indices: &[usize],
-    mut outer_node: usize,
+    mut outer_node: u32,
     dim: usize,
-) -> usize {
-    let mut queue: Vec<usize> = Vec::with_capacity(hole_indices.len());
+) -> u32 {
+    let mut queue: Vec<u32> = Vec::with_capacity(hole_indices.len());
 
     let len = hole_indices.len();
     for i in 0..len {
@@ -755,7 +770,7 @@ fn eliminate_holes(
         }
     }
 
-    queue.sort_by(|&a, &b| compare_xy_slope(arena, a, b));
+    queue.sort_unstable_by(|&a, &b| compare_xy_slope(arena, a, b));
 
     // block-bbox index for find_hole_bridge, grown append-only as holes merge. Seed it with
     // the outer ring, then append each merged hole.
@@ -774,7 +789,7 @@ fn eliminate_holes(
     filter_points(arena, outer_node, None)
 }
 
-fn compare_xy_slope(arena: &Arena, a: usize, b: usize) -> std::cmp::Ordering {
+fn compare_xy_slope(arena: &Arena, a: u32, b: u32) -> std::cmp::Ordering {
     let (an, bn) = (arena.get(a), arena.get(b));
     if an.x != bn.x {
         return an.x.partial_cmp(&bn.x).unwrap();
@@ -792,7 +807,7 @@ fn compare_xy_slope(arena: &Arena, a: usize, b: usize) -> std::cmp::Ordering {
 }
 
 /// find a bridge between vertices that connects hole with an outer ring and link it
-fn eliminate_hole(arena: &mut Arena, hole: usize, outer_node: usize) -> usize {
+fn eliminate_hole(arena: &mut Arena, hole: u32, outer_node: u32) -> u32 {
     let bridge = find_hole_bridge(arena, hole, outer_node);
     let bridge = match bridge {
         Some(b) => b,
@@ -819,12 +834,12 @@ fn eliminate_hole(arena: &mut Arena, hole: usize, outer_node: usize) -> usize {
 /// David Eberly's algorithm for finding a bridge between hole and outer polygon, using the
 /// block-bbox index built by `eliminate_holes` to skip whole runs of ring edges that can't
 /// possibly beat the current best crossing.
-fn find_hole_bridge(arena: &mut Arena, hole: usize, outer_node: usize) -> Option<usize> {
+fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32> {
     let p = outer_node;
     let hx = arena.get(hole).x;
     let hy = arena.get(hole).y;
     let mut qx = f64::NEG_INFINITY;
-    let mut m: Option<usize> = None;
+    let mut m: Option<u32> = None;
 
     // find a segment intersected by a ray from the hole's leftmost vertex to the left;
     // segment's endpoint with lesser x will be potential connection vertex, unless they
@@ -961,14 +976,14 @@ fn find_hole_bridge(arena: &mut Arena, hole: usize, outer_node: usize) -> Option
 }
 
 /// whether sector in vertex m contains sector in vertex p in the same coordinates
-fn sector_contains_sector(arena: &Arena, m: usize, p: usize) -> bool {
+fn sector_contains_sector(arena: &Arena, m: u32, p: u32) -> bool {
     arena.area(arena.get(m).prev, m, arena.get(p).prev) < 0.0
         && arena.area(arena.get(p).next, m, arena.get(m).next) < 0.0
 }
 
 /// interlink polygon nodes in z-order: collect into a vec, sort by z, relink
-fn index_curve(arena: &mut Arena, start: usize, min_x: f64, min_y: f64, inv_size: f64) {
-    let mut nodes: Vec<usize> = Vec::new();
+fn index_curve(arena: &mut Arena, start: u32, min_x: f64, min_y: f64, inv_size: f64) {
+    let mut nodes: Vec<u32> = Vec::new();
     let mut p = start;
     loop {
         let (x, y) = (arena.get(p).x, arena.get(p).y);
@@ -980,9 +995,9 @@ fn index_curve(arena: &mut Arena, start: usize, min_x: f64, min_y: f64, inv_size
         }
     }
 
-    nodes.sort_by_key(|&n| arena.get(n).z);
+    nodes.sort_unstable_by_key(|&n| arena.get(n).z);
 
-    let mut prev: usize = NULL;
+    let mut prev: u32 = NULL;
     for &node in &nodes {
         arena.get_mut(node).prev_z = prev;
         if prev != NULL {
@@ -1012,7 +1027,7 @@ fn z_order(x: f64, y: f64, min_x: f64, min_y: f64, inv_size: f64) -> i32 {
 }
 
 /// find the leftmost node of a polygon ring
-fn get_leftmost(arena: &Arena, start: usize) -> usize {
+fn get_leftmost(arena: &Arena, start: u32) -> u32 {
     let mut p = start;
     let mut leftmost = start;
     loop {
@@ -1048,7 +1063,7 @@ fn point_in_triangle(
 }
 
 /// check if a diagonal between two polygon nodes is valid (lies in polygon interior)
-fn is_valid_diagonal(arena: &Arena, a: usize, b: usize) -> bool {
+fn is_valid_diagonal(arena: &Arena, a: u32, b: u32) -> bool {
     let zero_length = arena.equals(a, b)
         && arena.area(arena.get(a).prev, a, arena.get(a).next) > 0.0
         && arena.area(arena.get(b).prev, b, arena.get(b).next) > 0.0;
@@ -1064,14 +1079,7 @@ fn is_valid_diagonal(arena: &Arena, a: usize, b: usize) -> bool {
 }
 
 /// check if two segments intersect; by default includes collinear boundary touches
-fn intersects(
-    arena: &Arena,
-    p1: usize,
-    q1: usize,
-    p2: usize,
-    q2: usize,
-    include_boundary: bool,
-) -> bool {
+fn intersects(arena: &Arena, p1: u32, q1: u32, p2: u32, q2: u32, include_boundary: bool) -> bool {
     let o1 = arena.area(p1, q1, p2);
     let o2 = arena.area(p1, q1, q2);
     let o3 = arena.area(p2, q2, p1);
@@ -1104,13 +1112,13 @@ fn intersects(
 }
 
 /// for collinear points p, q, r, check if point q lies on segment pr
-fn on_segment(arena: &Arena, p: usize, q: usize, r: usize) -> bool {
+fn on_segment(arena: &Arena, p: u32, q: u32, r: u32) -> bool {
     let (p, q, r) = (arena.get(p), arena.get(q), arena.get(r));
     q.x <= p.x.max(r.x) && q.x >= p.x.min(r.x) && q.y <= p.y.max(r.y) && q.y >= p.y.min(r.y)
 }
 
 /// check if a polygon diagonal intersects any polygon segments
-fn intersects_polygon(arena: &Arena, a: usize, b: usize) -> bool {
+fn intersects_polygon(arena: &Arena, a: u32, b: u32) -> bool {
     let (an, bn) = (arena.get(a), arena.get(b));
     let min_x = an.x.min(bn.x);
     let max_x = an.x.max(bn.x);
@@ -1151,7 +1159,7 @@ fn intersects_polygon(arena: &Arena, a: usize, b: usize) -> bool {
 }
 
 /// check if a polygon diagonal is locally inside the polygon
-fn locally_inside(arena: &Arena, a: usize, b: usize) -> bool {
+fn locally_inside(arena: &Arena, a: u32, b: u32) -> bool {
     let a_prev = arena.get(a).prev;
     let a_next = arena.get(a).next;
     if arena.area(a_prev, a, a_next) < 0.0 {
@@ -1162,7 +1170,7 @@ fn locally_inside(arena: &Arena, a: usize, b: usize) -> bool {
 }
 
 /// check if the middle point of a polygon diagonal is inside the polygon
-fn middle_inside(arena: &Arena, a: usize, b: usize) -> bool {
+fn middle_inside(arena: &Arena, a: u32, b: u32) -> bool {
     let (an, bn) = (arena.get(a), arena.get(b));
     let px = (an.x + bn.x) / 2.0;
     let py = (an.y + bn.y) / 2.0;
@@ -1188,7 +1196,7 @@ fn middle_inside(arena: &Arena, a: usize, b: usize) -> bool {
 /// link two polygon vertices with a bridge; if the vertices belong to the same ring, it
 /// splits the polygon into two; if one belongs to the outer ring and another to a hole, it
 /// merges them into a single ring
-fn split_polygon(arena: &mut Arena, a: usize, b: usize) -> usize {
+fn split_polygon(arena: &mut Arena, a: u32, b: u32) -> u32 {
     let (a_i, a_x, a_y) = {
         let n = arena.get(a);
         (n.i, n.x, n.y)

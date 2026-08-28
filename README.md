@@ -105,34 +105,47 @@ distributions; absolute numbers vary by machine, relative shape is the point)
 
 | Benchmark              | rearcut    | lyon (FillTessellator) | earcut.hpp (C++) |
 |-------------------------|-----------:|------------------------:|------------------:|
-| `fixtures/building` (13 tris) | 0.45 µs | 1.4 µs  | 0.25 µs |
-| `fixtures/dude` (106 tris)    | 6.2 µs  | 8.5 µs  | 4.2 µs |
-| `fixtures/bad-hole` (37 tris) | 3.1 µs  | 4.5 µs  | 2.2 µs |
-| `fixtures/water` (2482 tris)  | 279 µs  | 575 µs  | 200 µs |
-| `fixtures/water-huge` (5174 tris, 192 holes) | 1.8 ms | 1.3 ms | 1.5 ms |
-| `fixtures/water-huge3` (15470 tris, 1443 holes) | 25.6 ms | 5.0 ms | 21.4 ms |
-| `star/16` points        | 1.0 µs     | 4.0 µs | 0.7 µs |
-| `star/4096` points      | 17.4 ms    | 40 ms  | 15.2 ms |
-| `star/65536` points     | 5.1 s      | 9.6 s  | 4.3 s |
-| `holes/64` (8×8 grid)   | 64 µs      | 26 µs  | 44 µs |
-| `holes/1024` (32×32 grid) | 10.6 ms  | 0.66 ms | 7.5 ms |
+| `fixtures/building` (13 tris) | 0.34 µs | 1.4 µs  | 0.26 µs |
+| `fixtures/dude` (106 tris)    | 5.7 µs  | 8.6 µs  | 4.2 µs |
+| `fixtures/bad-hole` (37 tris) | 3.0 µs  | 4.4 µs  | 2.3 µs |
+| `fixtures/water` (2482 tris)  | 245 µs  | 545 µs  | 167 µs |
+| `fixtures/water-huge` (5174 tris, 192 holes) | 1.75 ms | 1.2 ms | 1.45 ms |
+| `fixtures/water-huge3` (15470 tris, 1443 holes) | 25.7 ms | 5.0 ms | 21.4 ms |
+| `star/16` points        | 0.96 µs    | 3.7 µs | 0.6 µs |
+| `star/4096` points      | 16.5 ms    | 41 ms  | 15.1 ms |
+| `star/65536` points     | 4.6 s      | 10.1 s | 4.3 s |
+| `holes/64` (8×8 grid)   | 69 µs      | 27 µs  | 43 µs |
+| `holes/1024` (32×32 grid) | 11.2 ms  | 0.69 ms | 7.4 ms |
 
 **Takeaway:** for simple-to-moderately-complex polygons, and especially for
 concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
 is consistently 2–4x faster than lyon's sweep-line tessellator, and now that
 it ports the same block-bbox hole-bridge index as `earcut.hpp`, it also
 tracks the native C++ reference closely on real many-holes polygons —
-`fixtures/water-huge3` dropped from 95 ms (classic linear scan) to 25.6 ms
+`fixtures/water-huge3` dropped from 95 ms (classic linear scan) to 25.7 ms
 after the port, versus `earcut.hpp`'s 21.4 ms (the remaining gap is mostly
 the safe arena's index indirection vs raw pointers, and Rust vs. GCC/Clang
 codegen). The one case where the block index doesn't pay off is the
 synthetic `holes` benchmark: its holes are tiny 4-vertex squares, well under
 the 16-edge block granularity, so each hole gets its own block and the
 per-block bookkeeping is pure overhead rather than a real skip — `earcut.hpp`
-shows the same effect there (44 µs / 7.5 ms), and lyon's sweep-line approach
+shows the same effect there (43 µs / 7.4 ms), and lyon's sweep-line approach
 is fastest of all on this shape of workload. In short: the block index is a
 genuine win for realistic hole-heavy polygons (many vertices per hole), and
 roughly neutral-to-slightly-negative for degenerate microscopic-hole grids.
+
+The arena's internal node links (`prev`/`next`/`prev_z`/`next_z`) are stored
+as `u32` rather than `usize`, shrinking each `Node` from 64 to 48 bytes
+(matching or beating earcut.hpp's raw-pointer-based C++ `Node`), and arena
+lookups use `get_unchecked` internally (indices are always either the `NULL`
+sentinel or values returned by the arena itself, so bounds checks are
+provably redundant and are asserted only in debug builds). Combined with
+pre-reserving the output triangle buffer and using unstable sorts for the
+hole-bridge queue and z-order curve, this closed most of the earlier gap on
+node-traversal-heavy workloads: `star/65536` went from 1.17x to ~1.07x of
+`earcut.hpp`'s time, and `fixtures/building` from 1.8x to ~1.3x. The
+`holes` benchmark's gap is largely unaffected, since it's dominated by
+hole-bridge search cost rather than node traversal.
 
 ## Acknowledgements
 
