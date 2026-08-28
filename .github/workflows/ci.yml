@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets --release -- -D warnings
+
+      - name: Clippy (earcut-hpp feature)
+        run: cargo clippy --all-targets --release --features earcut-hpp -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --release
+
+      - name: Test (earcut-hpp feature)
+        run: cargo test --release --features earcut-hpp
+
+      - name: Build benches (no run)
+        run: cargo bench --features earcut-hpp --no-run
