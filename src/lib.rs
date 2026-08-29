@@ -175,6 +175,17 @@ impl Arena {
         }
     }
 
+    /// Clear all per-triangulation state while keeping every buffer's allocation, so a
+    /// reused `Arena` (see `Earcut`) never reallocates once its buffers have grown to fit
+    /// the largest input seen so far.
+    fn reset(&mut self, capacity_hint: usize) {
+        self.nodes.clear();
+        self.nodes.reserve(capacity_hint);
+        self.filtered_out = false;
+        self.num_blocks = 0;
+        self.index_active = false;
+    }
+
     #[inline]
     fn create_node(&mut self, i: u32, x: f64, y: f64) -> u32 {
         self.nodes.push(Node::new(i, x, y));
@@ -358,6 +369,12 @@ impl Arena {
     }
 }
 
+impl Default for Arena {
+    fn default() -> Self {
+        Arena::new(0)
+    }
+}
+
 /// Triangulate a polygon given as a flat array of vertex coordinates.
 ///
 /// `data` is a flat array of vertex coordinates (`dim` numbers per vertex, x/y first).
@@ -366,6 +383,9 @@ impl Arena {
 /// there are no holes) is the outer ring.
 ///
 /// Returns the triangulation as flat triplets of vertex indices into `data`.
+///
+/// This allocates a fresh internal arena on every call; for repeated triangulations,
+/// [`Earcut`] reuses its arena's allocations across calls instead.
 pub fn earcut<N: EarcutIndex>(data: &[f64], hole_indices: &[usize], dim: usize) -> Vec<N> {
     let mut triangles = Vec::new();
     earcut_into(data, hole_indices, dim, &mut triangles);
@@ -373,8 +393,53 @@ pub fn earcut<N: EarcutIndex>(data: &[f64], hole_indices: &[usize], dim: usize) 
 }
 
 /// Same as [`earcut`], but appends into a caller-provided `Vec` (which is cleared first).
-/// Useful to reuse allocations across repeated triangulations.
+/// Useful to reuse the output allocation across repeated triangulations; the internal arena
+/// is still freshly allocated each call — use [`Earcut`] to reuse both.
 pub fn earcut_into<N: EarcutIndex>(
+    data: &[f64],
+    hole_indices: &[usize],
+    dim: usize,
+    triangles: &mut Vec<N>,
+) {
+    let mut arena = Arena::new(0);
+    earcut_impl(&mut arena, data, hole_indices, dim, triangles);
+}
+
+/// A reusable triangulator: keeps its internal arena's allocations (nodes, hole-bridge
+/// block index, z-order sort scratch buffers) across calls, so repeated triangulations
+/// (even of different, unrelated polygons) only allocate while growing to the largest
+/// input seen so far, instead of once per call like the free [`earcut`]/[`earcut_into`]
+/// functions.
+#[derive(Default)]
+pub struct Earcut {
+    arena: Arena,
+}
+
+impl Earcut {
+    /// Create a new, empty reusable triangulator.
+    pub fn new() -> Self {
+        Self {
+            arena: Arena::new(0),
+        }
+    }
+
+    /// Triangulate `data`/`hole_indices`/`dim` (see [`earcut`]), appending into
+    /// `triangles` (cleared first), reusing this `Earcut`'s internal buffers.
+    pub fn earcut_into<N: EarcutIndex>(
+        &mut self,
+        data: &[f64],
+        hole_indices: &[usize],
+        dim: usize,
+        triangles: &mut Vec<N>,
+    ) {
+        earcut_impl(&mut self.arena, data, hole_indices, dim, triangles);
+    }
+}
+
+/// Shared triangulation body driving `arena`; used by both the one-shot free functions
+/// (fresh `Arena` each call) and `Earcut` (persistent `Arena` reused across calls).
+fn earcut_impl<N: EarcutIndex>(
+    arena: &mut Arena,
     data: &[f64],
     hole_indices: &[usize],
     dim: usize,
@@ -398,9 +463,9 @@ pub fn earcut_into<N: EarcutIndex>(
         data.len()
     };
 
-    let mut arena = Arena::new(data.len() / dim + 8);
+    arena.reset(n_estimate + 8);
 
-    let outer_node = linked_list(&mut arena, data, 0, outer_len, dim, true);
+    let outer_node = linked_list(arena, data, 0, outer_len, dim, true);
     let mut outer_node = match outer_node {
         Some(n) => n,
         None => return,
@@ -415,7 +480,7 @@ pub fn earcut_into<N: EarcutIndex>(
     let mut inv_size = 0.0;
 
     if has_holes {
-        outer_node = eliminate_holes(&mut arena, data, hole_indices, outer_node, dim);
+        outer_node = eliminate_holes(arena, data, hole_indices, outer_node, dim);
     }
 
     if data.len() > 80 * dim {
@@ -451,7 +516,7 @@ pub fn earcut_into<N: EarcutIndex>(
         };
     }
 
-    earcut_linked(&mut arena, outer_node, triangles, min_x, min_y, inv_size);
+    earcut_linked(arena, outer_node, triangles, min_x, min_y, inv_size);
 }
 
 /// create a circular doubly linked list from polygon points in the specified winding order
@@ -1438,5 +1503,30 @@ mod tests {
         let data = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let triangles: Vec<u32> = earcut(&data, &[], 2);
         assert!(triangles.is_empty());
+    }
+
+    #[test]
+    fn reusable_earcut_matches_one_shot() {
+        let quad = [10.0, 0.0, 0.0, 50.0, 60.0, 60.0, 70.0, 10.0];
+        let hole_square = [
+            0.0, 0.0, 100.0, 0.0, 100.0, 100.0, 0.0, 100.0, 20.0, 20.0, 80.0, 20.0, 80.0, 80.0,
+            20.0, 80.0,
+        ];
+
+        let mut earcutter = Earcut::new();
+        let mut out: Vec<u32> = Vec::new();
+
+        // triangulate a few different shapes back-to-back on the same `Earcut`, and check
+        // each result matches what the one-shot `earcut` function returns.
+        for _ in 0..3 {
+            earcutter.earcut_into(&quad, &[], 2, &mut out);
+            assert_eq!(out, earcut::<u32>(&quad, &[], 2));
+
+            earcutter.earcut_into(&hole_square, &[4], 2, &mut out);
+            assert_eq!(out, earcut::<u32>(&hole_square, &[4], 2));
+
+            earcutter.earcut_into(&[], &[], 2, &mut out);
+            assert!(out.is_empty());
+        }
     }
 }

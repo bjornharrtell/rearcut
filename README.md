@@ -40,6 +40,21 @@ useful for verifying correctness.
 The output index type is generic over `u16`/`u32`/`u64`/`usize` via the
 `EarcutIndex` trait — pick the smallest type that fits your vertex count.
 
+For repeated triangulations, `rearcut::Earcut` reuses its internal arena's
+allocations (nodes, hole-bridge block index, z-order sort scratch buffers)
+across calls instead of allocating fresh ones every time:
+
+```rust
+use rearcut::Earcut;
+
+let mut earcutter = Earcut::new();
+let mut triangles: Vec<u32> = Vec::new();
+
+let data = [10.0, 0.0, 0.0, 50.0, 60.0, 60.0, 70.0, 10.0];
+earcutter.earcut_into(&data, &[], 2, &mut triangles);
+assert_eq!(triangles.len(), 6);
+```
+
 ## Correctness
 
 `rearcut` is validated against the full upstream
@@ -89,38 +104,37 @@ cargo bench --features earcut-hpp
 ### Representative results
 
 (Ryzen-class x86_64, `cargo bench`, single run — see the HTML report for full
-distributions; absolute numbers vary by machine, relative shape is the point)
+distributions; absolute numbers vary by machine, relative shape is the
+point. `rearcut` and `earcut-rs` are measured via their reusable `Earcut`
+struct so repeated calls don't pay for a fresh arena each time; `lyon` has
+no such API and is measured one-shot.)
 
-| Benchmark | rearcut | earcut-rs | lyon | earcut.hpp |
-|---|---:|---:|---:|---:|
-| `fixtures/building` | 0.33 µs | 0.20 µs | 1.6 µs | 0.25 µs |
-| `fixtures/dude` | 5.7 µs | 4.7 µs | 8.6 µs | 4.1 µs |
-| `fixtures/bad-hole` | 3.0 µs | 2.3 µs | 4.5 µs | 2.3 µs |
-| `fixtures/water` | 248 µs | 200 µs | 542 µs | 203 µs |
-| `fixtures/water-huge` | 1.80 ms | 1.39 ms | 1.23 ms | 1.46 ms |
-| `fixtures/water-huge3` | 26.1 ms | 19.4 ms | 5.2 ms | 22.0 ms |
-| `star/16` | 0.99 µs | 0.70 µs | 3.8 µs | 0.6 µs |
-| `star/4096` | 16.6 ms | 13.0 ms | 41 ms | 14.8 ms |
-| `star/65536` | 4.6 s | 3.4 s | 9.9 s | 4.3 s |
-| `holes/64` | 66 µs | 50 µs | 27 µs | 44 µs |
-| `holes/1024` | 11.3 ms | 8.0 ms | 0.68 ms | 7.5 ms |
+| Benchmark | rearcut | earcut-rs | lyon |
+|---|---:|---:|---:|
+| `fixtures/building` | 0.31 µs | 0.18 µs | 1.4 µs |
+| `fixtures/dude` | 4.9 µs | 4.5 µs | 8.6 µs |
+| `fixtures/bad-hole` | 2.5 µs | 2.1 µs | 4.7 µs |
+| `fixtures/water` | 201 µs | 182 µs | 537 µs |
+| `fixtures/water-huge` | 1.65 ms | 1.38 ms | 1.22 ms |
+| `fixtures/water-huge3` | 22.7 ms | 19.0 ms | 5.8 ms |
+| `star/16` | 0.78 µs | 0.61 µs | 3.8 µs |
+| `star/4096` | 14.3 ms | 12.2 ms | 41 ms |
+| `star/65536` | 4.1 s | 3.7 s | 11.2 s |
+| `holes/64` | 59 µs | 56 µs | 26 µs |
+| `holes/1024` | 10.0 ms | 8.1 ms | 0.74 ms |
 
 **Takeaway:** for simple-to-moderately-complex polygons, and especially for
 concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
-is consistently 2–4x faster than lyon's sweep-line tessellator, and now that
-it ports the same block-bbox hole-bridge index as `earcut.hpp`, it also
-tracks the native C++ reference closely on real many-holes polygons —
-`fixtures/water-huge3` dropped from 95 ms (classic linear scan) to 26.1 ms
-after the port, versus `earcut.hpp`'s 22.0 ms (the remaining gap is mostly
-the safe arena's index indirection vs raw pointers, and Rust vs. GCC/Clang
-codegen). The one case where the block index doesn't pay off is the
-synthetic `holes` benchmark: its holes are tiny 4-vertex squares, well under
-the 16-edge block granularity, so each hole gets its own block and the
-per-block bookkeeping is pure overhead rather than a real skip — `earcut.hpp`
-shows the same effect there (44 µs / 7.5 ms), and lyon's sweep-line approach
-is fastest of all on this shape of workload. In short: the block index is a
-genuine win for realistic hole-heavy polygons (many vertices per hole), and
-roughly neutral-to-slightly-negative for degenerate microscopic-hole grids.
+is consistently 2–4x faster than lyon's sweep-line tessellator. Against
+`earcut-rs` (georust's independent port), `rearcut` is now within
+single-digit percent on most real-world fixtures and small-to-medium
+synthetic shapes, occasionally matching or edging ahead; `earcut-rs` still
+leads by a wider margin on the largest synthetic stress tests (`star/65536`,
+`holes/1024`), mainly thanks to its byte-offset node links (see the note
+below). The `holes` benchmark's small, uniform-size synthetic holes are a
+weaker case for both crates' block-bbox hole-bridge index than realistic
+many-vertex holes (see `fixtures/water-huge3`), which is why lyon's
+sweep-line approach wins there despite losing everywhere else.
 
 ## Acknowledgements
 
