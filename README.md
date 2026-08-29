@@ -112,32 +112,30 @@ one-shot.)
 
 | Benchmark | rearcut | earcut-rs | lyon | earcut.hpp |
 |---|---:|---:|---:|---:|
-| `fixtures/building` | 0.16 µs | 0.21 µs | 1.4 µs | 0.24 µs |
-| `fixtures/dude` | 4.6 µs | 4.4 µs | 8.6 µs | 4.1 µs |
-| `fixtures/bad-hole` | 2.2 µs | 2.1 µs | 4.7 µs | 2.1 µs |
-| `fixtures/water` | 206 µs | 191 µs | 537 µs | 255 µs |
-| `fixtures/water-huge` | 1.50 ms | 1.37 ms | 1.22 ms | 1.44 ms |
-| `fixtures/water-huge3` | 22.7 ms | 18.8 ms | 5.8 ms | 21.2 ms |
-| `star/16` | 0.64 µs | 0.58 µs | 3.8 µs | 0.59 µs |
-| `star/4096` | 14.7 ms | 12.8 ms | 41 ms | 14.7 ms |
-| `star/65536` | 3.9 s | 3.4 s | 11.2 s | 4.3 s |
-| `holes/64` | 55 µs | 47 µs | 26 µs | 44 µs |
-| `holes/1024` | 9.4 ms | 8.1 ms | 0.74 ms | 7.4 ms |
+| `fixtures/building` | 0.16 µs | 0.17 µs | 1.4 µs | 0.25 µs |
+| `fixtures/dude` | 4.1 µs | 4.4 µs | 8.6 µs | 4.2 µs |
+| `fixtures/bad-hole` | 1.9 µs | 2.1 µs | 4.7 µs | 2.3 µs |
+| `fixtures/water` | 177 µs | 191 µs | 537 µs | 193 µs |
+| `fixtures/water-huge` | 1.46 ms | 1.36 ms | 1.22 ms | 1.48 ms |
+| `fixtures/water-huge3` | 21.1 ms | 19.1 ms | 5.8 ms | 21.3 ms |
+| `star/16` | 0.53 µs | 0.58 µs | 3.8 µs | 0.60 µs |
+| `star/4096` | 12.4 ms | 12.3 ms | 41 ms | 15.2 ms |
+| `star/65536` | 3.46 s | 3.37 s | 11.2 s | 4.3 s |
+| `holes/64` | 46 µs | 47 µs | 26 µs | 44 µs |
+| `holes/1024` | 8.0 ms | 7.8 ms | 0.74 ms | 7.4 ms |
 
 **Takeaway:** for simple-to-moderately-complex polygons, and especially for
 concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
 is consistently 2–4x faster than lyon's sweep-line tessellator. Against
-`earcut-rs` (georust's independent port), `rearcut` now wins on tiny inputs
-(`fixtures/building`) and roughly ties on several small-to-medium
-real-world fixtures (`water3b`, `water4`, `bad-hole`), but is still
-genuinely 7–21% slower on larger/synthetic stress tests (`star`, `holes`,
-`water-huge3`) — mainly attributable to `earcut-rs`'s byte-offset node
-links, which avoid the stride multiplication our plain index-into-`Vec`
-arena pays on every node dereference. Closing that remaining gap is an
-open, ongoing effort. The `holes` benchmark's small, uniform-size synthetic
-holes are a weaker case for both crates' block-bbox hole-bridge index than
-realistic many-vertex holes (see `fixtures/water-huge3`), which is why
-lyon's sweep-line approach wins there despite losing everywhere else.
+`earcut-rs` (georust's independent port), `rearcut` now wins or ties on
+most benchmarks — after switching node handles to precomputed byte
+offsets (like `earcut-rs`'s `NodeOffset`), avoiding a stride multiply on
+every node dereference — with a small remaining gap (~2–11%) only on a
+few of the largest inputs (`water-huge`, `water-huge3`, `water2`). The
+`holes` benchmark's small, uniform-size synthetic holes are a weaker case
+for both crates' block-bbox hole-bridge index than realistic many-vertex
+holes (see `fixtures/water-huge3`), which is why lyon's sweep-line
+approach wins there despite losing everywhere else.
 
 ## Acknowledgements
 

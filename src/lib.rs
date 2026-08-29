@@ -186,30 +186,59 @@ impl Arena {
         self.index_active = false;
     }
 
+    /// `Node` is kept as small as possible (40 bytes, 8-byte aligned) so large rings fit more
+    /// nodes per cache line. Node "handles" (`prev`/`next`/`prev_z`/`next_z`, and every `u32`
+    /// returned by `create_node`/`insert_node`) are **byte offsets** into `Arena::nodes`'s
+    /// backing storage, not element indices: `create_node` computes `index * NODE_SIZE` once
+    /// when a node is created, and `Arena::get`/`get_mut` dereference via `byte_add` (a plain
+    /// pointer add, no multiply) instead of slice indexing (which would redo `idx * NODE_SIZE`
+    /// — a non-power-of-two stride, so an actual multiply — on every single access). This
+    /// mirrors georust/earcut's `NodeOffset` design.
+    const NODE_SIZE: usize = std::mem::size_of::<Node>();
+
     #[inline]
     fn create_node(&mut self, i: u32, x: f64, y: f64) -> u32 {
+        let index = self.nodes.len();
         self.nodes.push(Node::new(i, x, y));
-        (self.nodes.len() - 1) as u32
+        // guard against a byte offset colliding with the `NULL` sentinel or overflowing `u32`;
+        // in practice this would require ~100M+ vertices, already impractical for other reasons
+        assert!(
+            (index + 1) * Self::NODE_SIZE < NULL as usize,
+            "too many nodes for a u32 byte-offset arena"
+        );
+        (index * Self::NODE_SIZE) as u32
     }
 
     #[inline(always)]
-    fn get(&self, idx: u32) -> &Node {
-        let idx = idx as usize;
-        debug_assert!(idx < self.nodes.len(), "arena index out of bounds");
-        // Safety: every index handled by this arena is either `NULL` (checked by callers
-        // before dereferencing) or was returned by `create_node`/`insert_node`, which only
-        // ever grows `nodes` and is never removed from the backing `Vec` (nodes are unlinked
-        // from the doubly linked list, not deallocated) — so any non-`NULL` index passed here
-        // is always in bounds.
-        unsafe { self.nodes.get_unchecked(idx) }
+    fn get(&self, off: u32) -> &Node {
+        debug_assert!(
+            (off as usize).is_multiple_of(Self::NODE_SIZE),
+            "misaligned node offset"
+        );
+        debug_assert!(
+            (off as usize / Self::NODE_SIZE) < self.nodes.len(),
+            "arena offset out of bounds"
+        );
+        // Safety: every offset handled by this arena is either `NULL` (checked by callers
+        // before dereferencing) or was returned by `create_node`/`insert_node` as
+        // `index * NODE_SIZE` for some `index < self.nodes.len()` at the time of creation;
+        // `nodes` only ever grows (nodes are unlinked from the doubly linked list, not
+        // deallocated), so any non-`NULL` offset passed here always lands on a live element.
+        unsafe { &*self.nodes.as_ptr().byte_add(off as usize) }
     }
 
     #[inline(always)]
-    fn get_mut(&mut self, idx: u32) -> &mut Node {
-        let idx = idx as usize;
-        debug_assert!(idx < self.nodes.len(), "arena index out of bounds");
+    fn get_mut(&mut self, off: u32) -> &mut Node {
+        debug_assert!(
+            (off as usize).is_multiple_of(Self::NODE_SIZE),
+            "misaligned node offset"
+        );
+        debug_assert!(
+            (off as usize / Self::NODE_SIZE) < self.nodes.len(),
+            "arena offset out of bounds"
+        );
         // Safety: see `get`.
-        unsafe { self.nodes.get_unchecked_mut(idx) }
+        unsafe { &mut *self.nodes.as_mut_ptr().byte_add(off as usize) }
     }
 
     /// create a node and optionally link it with previous one (in a circular doubly linked list)
