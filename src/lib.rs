@@ -66,28 +66,37 @@ macro_rules! impl_earcut_index {
 
 impl_earcut_index!(u16, u32, u64, usize);
 
+/// top bit of `Node::i_steiner` flags a steiner point; the rest holds the vertex index.
+const STEINER_BIT: u32 = 1 << 31;
+const INDEX_MASK: u32 = !STEINER_BIT;
+
+// `Node` is kept as small as possible (40 bytes, 8-byte aligned) so large rings fit more
+// nodes per cache line: the steiner flag is packed into the top bit of the vertex index
+// (mirrors upstream's `i_steiner` trick) instead of a separate `bool` field, and the vertex
+// index itself is `u32` (an input with more than u32::MAX vertices would already exhaust
+// memory for its coordinate array well before this becomes a limitation).
 #[derive(Clone, Copy)]
 struct Node {
-    /// original vertex index in the input coordinates array
-    i: usize,
+    /// original vertex index in the input coordinates array (lower 31 bits) + steiner flag
+    /// (bit 31)
+    i_steiner: u32,
+    /// z-order curve value
+    z: i32,
     x: f64,
     y: f64,
     /// previous and next vertex nodes in a polygon ring
     prev: u32,
     next: u32,
-    /// z-order curve value
-    z: i32,
     /// previous and next nodes in z-order (NULL if none)
     prev_z: u32,
     next_z: u32,
-    /// whether this is a steiner point (single-vertex hole)
-    steiner: bool,
 }
 
 impl Node {
-    fn new(i: usize, x: f64, y: f64) -> Self {
+    #[inline]
+    fn new(i: u32, x: f64, y: f64) -> Self {
         Node {
-            i,
+            i_steiner: i,
             x,
             y,
             prev: NULL,
@@ -95,8 +104,22 @@ impl Node {
             z: 0,
             prev_z: NULL,
             next_z: NULL,
-            steiner: false,
         }
+    }
+
+    #[inline(always)]
+    fn i(&self) -> u32 {
+        self.i_steiner & INDEX_MASK
+    }
+
+    #[inline(always)]
+    fn is_steiner(&self) -> bool {
+        self.i_steiner & STEINER_BIT != 0
+    }
+
+    #[inline(always)]
+    fn set_steiner(&mut self) {
+        self.i_steiner |= STEINER_BIT;
     }
 }
 
@@ -130,6 +153,11 @@ struct Arena {
     /// true only while `eliminate_holes` merges holes, so `remove_node` keeps the block
     /// index live (via `grow_block`)
     index_active: bool,
+
+    /// scratch buffers for `index_curve`/`sort_by_z`, reused across (possibly recursive,
+    /// via `split_earcut`) calls to avoid a heap allocation each time.
+    z_order_buf: Vec<(i32, u32)>,
+    z_order_scratch: Vec<(i32, u32)>,
 }
 
 impl Arena {
@@ -142,11 +170,13 @@ impl Arena {
             block_stop: Vec::new(),
             num_blocks: 0,
             index_active: false,
+            z_order_buf: Vec::new(),
+            z_order_scratch: Vec::new(),
         }
     }
 
     #[inline]
-    fn create_node(&mut self, i: usize, x: f64, y: f64) -> u32 {
+    fn create_node(&mut self, i: u32, x: f64, y: f64) -> u32 {
         self.nodes.push(Node::new(i, x, y));
         (self.nodes.len() - 1) as u32
     }
@@ -172,7 +202,7 @@ impl Arena {
     }
 
     /// create a node and optionally link it with previous one (in a circular doubly linked list)
-    fn insert_node(&mut self, i: usize, x: f64, y: f64, last: u32) -> u32 {
+    fn insert_node(&mut self, i: u32, x: f64, y: f64, last: u32) -> u32 {
         let p = self.create_node(i, x, y);
 
         if last == NULL {
@@ -241,7 +271,7 @@ impl Arena {
             let mut k: i32 = 0;
             loop {
                 let c = self.get(p).next; // edge p->c; bbox must bound both endpoints
-                                          // reuse z as the owning block during eliminate_holes (see grow_block)
+                // reuse z as the owning block during eliminate_holes (see grow_block)
                 self.get_mut(p).z = b as i32;
                 let (px, py) = (self.get(p).x, self.get(p).y);
                 let (cx, cy) = (self.get(c).x, self.get(c).y);
@@ -438,14 +468,14 @@ fn linked_list(
     if clockwise == (signed_area(data, start, end, dim) > 0.0) {
         let mut i = start;
         while i < end {
-            last = arena.insert_node(i / dim, data[i], data[i + 1], last);
+            last = arena.insert_node((i / dim) as u32, data[i], data[i + 1], last);
             i += dim;
         }
     } else {
         let mut i = end;
         while i > start {
             i -= dim;
-            last = arena.insert_node(i / dim, data[i], data[i + 1], last);
+            last = arena.insert_node((i / dim) as u32, data[i], data[i + 1], last);
         }
     }
 
@@ -457,11 +487,7 @@ fn linked_list(
         }
     }
 
-    if last == NULL {
-        None
-    } else {
-        Some(last)
-    }
+    if last == NULL { None } else { Some(last) }
 }
 
 /// Remove collinear or coincident points; removability depends only on a node's immediate
@@ -478,7 +504,7 @@ fn filter_points(arena: &mut Arena, start: u32, end: Option<u32>) -> u32 {
     loop {
         again = false;
         let node = arena.get(p);
-        let (p_next, p_prev, steiner) = (node.next, node.prev, node.steiner);
+        let (p_next, p_prev, steiner) = (node.next, node.prev, node.is_steiner());
         if p != p_next
             && !steiner
             && (arena.equals(p, p_next) || arena.area(p_prev, p, p_next) == 0.0)
@@ -536,9 +562,9 @@ fn earcut_linked<N: EarcutIndex>(
                 is_ear(arena, ear)
             })
         {
-            let pi = arena.get(prev).i;
-            let ei = arena.get(ear).i;
-            let ni = arena.get(next).i;
+            let pi = arena.get(prev).i() as usize;
+            let ei = arena.get(ear).i() as usize;
+            let ni = arena.get(next).i() as usize;
             triangles.push(N::from_usize(pi));
             triangles.push(N::from_usize(ei));
             triangles.push(N::from_usize(ni));
@@ -685,9 +711,9 @@ fn cure_local_intersections<N: EarcutIndex>(
             && locally_inside(arena, a, b)
             && locally_inside(arena, b, a)
         {
-            triangles.push(N::from_usize(arena.get(a).i));
-            triangles.push(N::from_usize(arena.get(p).i));
-            triangles.push(N::from_usize(arena.get(b).i));
+            triangles.push(N::from_usize(arena.get(a).i() as usize));
+            triangles.push(N::from_usize(arena.get(p).i() as usize));
+            triangles.push(N::from_usize(arena.get(b).i() as usize));
 
             let p_next = arena.get(p).next;
             arena.remove_node(p);
@@ -723,7 +749,7 @@ fn split_earcut<N: EarcutIndex>(
     loop {
         let mut b = arena.get(arena.get(a).next).next;
         while b != arena.get(a).prev {
-            if arena.get(a).i != arena.get(b).i && is_valid_diagonal(arena, a, b) {
+            if arena.get(a).i() != arena.get(b).i() && is_valid_diagonal(arena, a, b) {
                 let c = split_polygon(arena, a, b);
 
                 let a_next = arena.get(a).next;
@@ -764,7 +790,7 @@ fn eliminate_holes(
         };
         if let Some(list) = linked_list(arena, data, start, end, dim, false) {
             if list == arena.get(list).next {
-                arena.get_mut(list).steiner = true;
+                arena.get_mut(list).set_steiner();
             }
             queue.push(get_leftmost(arena, list));
         }
@@ -983,22 +1009,27 @@ fn sector_contains_sector(arena: &Arena, m: u32, p: u32) -> bool {
 
 /// interlink polygon nodes in z-order: collect into a vec, sort by z, relink
 fn index_curve(arena: &mut Arena, start: u32, min_x: f64, min_y: f64, inv_size: f64) {
-    let mut nodes: Vec<u32> = Vec::new();
+    arena.z_order_buf.clear();
     let mut p = start;
     loop {
         let (x, y) = (arena.get(p).x, arena.get(p).y);
-        arena.get_mut(p).z = z_order(x, y, min_x, min_y, inv_size);
-        nodes.push(p);
+        let z = z_order(x, y, min_x, min_y, inv_size);
+        arena.get_mut(p).z = z;
+        arena.z_order_buf.push((z, p));
         p = arena.get(p).next;
         if p == start {
             break;
         }
     }
 
-    nodes.sort_unstable_by_key(|&n| arena.get(n).z);
+    // reuse the arena's scratch Vecs across calls (avoids a heap allocation per
+    // `index_curve` invocation, which recurses through `split_earcut`)
+    let mut order = std::mem::take(&mut arena.z_order_buf);
+    let mut scratch = std::mem::take(&mut arena.z_order_scratch);
+    sort_by_z(&mut order, &mut scratch);
 
     let mut prev: u32 = NULL;
-    for &node in &nodes {
+    for &(_, node) in order.iter() {
         arena.get_mut(node).prev_z = prev;
         if prev != NULL {
             arena.get_mut(prev).next_z = node;
@@ -1006,6 +1037,65 @@ fn index_curve(arena: &mut Arena, start: u32, min_x: f64, min_y: f64, inv_size: 
         prev = node;
     }
     arena.get_mut(prev).next_z = NULL;
+
+    arena.z_order_buf = order;
+    arena.z_order_scratch = scratch;
+}
+
+/// Sort a z-order queue. Small queues use `sort_unstable_by_key` (introsort); large ones
+/// (>= `RADIX_MIN_LEN`) use four stable byte-wise LSD radix passes, which is O(n) instead of
+/// O(n log n) and a clear win once n is large enough to amortize the counting passes (this
+/// is where `index_curve` spends most of its time on big star/hole-grid inputs).
+fn sort_by_z(order: &mut [(i32, u32)], scratch: &mut Vec<(i32, u32)>) {
+    const RADIX_MIN_LEN: usize = 512;
+    let n = order.len();
+    if n < RADIX_MIN_LEN {
+        order.sort_unstable_by_key(|&(z, _)| z);
+        return;
+    }
+
+    #[inline(always)]
+    fn scatter(src: &[(i32, u32)], dst: &mut [(i32, u32)], shift: u32, offsets: &mut [u32; 256]) {
+        for &item in src {
+            let bucket = (item.0 as u32 >> shift & 0xff) as usize;
+            dst[offsets[bucket] as usize] = item;
+            offsets[bucket] += 1;
+        }
+    }
+
+    let mut counts = [[0u32; 256]; 4];
+    for &(z, _) in order.iter() {
+        let key = z as u32;
+        counts[0][(key & 0xff) as usize] += 1;
+        counts[1][(key >> 8 & 0xff) as usize] += 1;
+        counts[2][(key >> 16 & 0xff) as usize] += 1;
+        counts[3][(key >> 24 & 0xff) as usize] += 1;
+    }
+
+    scratch.resize(n, order[0]);
+    let mut in_order = true;
+    for (pass, counts) in counts.iter().enumerate() {
+        // a pass where every item lands in the same bucket can't reorder anything: skip it
+        if counts.iter().any(|&count| count as usize == n) {
+            continue;
+        }
+        let mut offsets = [0u32; 256];
+        let mut sum = 0;
+        for (offset, &count) in offsets.iter_mut().zip(counts.iter()) {
+            *offset = sum;
+            sum += count;
+        }
+        let shift = pass as u32 * 8;
+        if in_order {
+            scatter(order, scratch, shift, &mut offsets);
+        } else {
+            scatter(scratch, order, shift, &mut offsets);
+        }
+        in_order = !in_order;
+    }
+    if !in_order {
+        order.copy_from_slice(scratch);
+    }
 }
 
 /// z-order of a point given coords and inverse of the longer side of data bbox
@@ -1068,7 +1158,7 @@ fn is_valid_diagonal(arena: &Arena, a: u32, b: u32) -> bool {
         && arena.area(arena.get(a).prev, a, arena.get(a).next) > 0.0
         && arena.area(arena.get(b).prev, b, arena.get(b).next) > 0.0;
 
-    arena.get(arena.get(a).next).i != arena.get(b).i
+    arena.get(arena.get(a).next).i() != arena.get(b).i()
         && (zero_length
             || (locally_inside(arena, a, b)
                 && locally_inside(arena, b, a)
@@ -1125,8 +1215,8 @@ fn intersects_polygon(arena: &Arena, a: u32, b: u32) -> bool {
     let min_y = an.y.min(bn.y);
     let max_y = an.y.max(bn.y);
 
-    let a_i = arena.get(a).i;
-    let b_i = arena.get(b).i;
+    let a_i = arena.get(a).i();
+    let b_i = arena.get(b).i();
 
     let mut p = a;
     loop {
@@ -1138,8 +1228,8 @@ fn intersects_polygon(arena: &Arena, a: u32, b: u32) -> bool {
             || (py > max_y && ny > max_y)
             || (py < min_y && ny < min_y))
         {
-            let p_i = arena.get(p).i;
-            let n_i = arena.get(n).i;
+            let p_i = arena.get(p).i();
+            let n_i = arena.get(n).i();
             if p_i != a_i
                 && n_i != a_i
                 && p_i != b_i
@@ -1199,11 +1289,11 @@ fn middle_inside(arena: &Arena, a: u32, b: u32) -> bool {
 fn split_polygon(arena: &mut Arena, a: u32, b: u32) -> u32 {
     let (a_i, a_x, a_y) = {
         let n = arena.get(a);
-        (n.i, n.x, n.y)
+        (n.i(), n.x, n.y)
     };
     let (b_i, b_x, b_y) = {
         let n = arena.get(b);
-        (n.i, n.x, n.y)
+        (n.i(), n.x, n.y)
     };
 
     let a2 = arena.create_node(a_i, a_x, a_y);

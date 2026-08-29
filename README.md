@@ -6,9 +6,7 @@ z-order curve hash for O(n) average-case performance. It triangulates simple
 polygons that can be concave and have holes.
 
 This crate is a from-scratch, safe-Rust reimplementation of the earcut
-algorithm (arena/`Vec`-backed doubly linked list instead of raw pointers —
-no `unsafe`), including upstream's block-bbox hole-bridge index (see
-"Correctness" below), API-compatible in spirit with the original JS/C++
+algorithm API-compatible in spirit with the original JS/C++
 libraries.
 
 ## Usage
@@ -48,18 +46,6 @@ The output index type is generic over `u16`/`u32`/`u64`/`usize` via the
 [mapbox/earcut test fixture suite](https://github.com/mapbox/earcut/tree/main/test)
 (58 real-world and adversarial polygons, vendored under `tests/fixtures/`,
 checked against `tests/expected.json`), see `tests/fixtures_test.rs`.
-
-Upstream's implementation uses a block-bbox spatial index to accelerate
-hole-bridge search (issue #183): ring edges are grouped into fixed-size
-blocks, each with a cached bounding box, so the leftward-ray scan can skip
-whole blocks instead of walking every merged-ring node. This port includes
-the same block index (see `Arena::build_block_index`/`index_segment` in
-`src/lib.rs`), so triangle counts match upstream almost exactly — of the 58
-fixtures, only `issue142` (a hole touching the outer ring at a vertex) picks
-a different, still-valid ear and differs by one triangle, which the test
-suite tolerates explicitly. All other fixtures require an exact triangle
-count when specified, plus a deviation (relative area error) check within
-the documented tolerance.
 
 Run the test suite with:
 
@@ -105,19 +91,19 @@ cargo bench --features earcut-hpp
 (Ryzen-class x86_64, `cargo bench`, single run — see the HTML report for full
 distributions; absolute numbers vary by machine, relative shape is the point)
 
-| Benchmark              | rearcut    | earcut-rs (georust) | lyon (FillTessellator) | earcut.hpp (C++) |
-|-------------------------|-----------:|---------------------:|------------------------:|------------------:|
-| `fixtures/building` (13 tris) | 0.33 µs | 0.20 µs | 1.6 µs  | 0.25 µs |
-| `fixtures/dude` (106 tris)    | 5.7 µs  | 4.7 µs  | 8.6 µs  | 4.1 µs |
-| `fixtures/bad-hole` (37 tris) | 3.0 µs  | 2.3 µs  | 4.5 µs  | 2.3 µs |
-| `fixtures/water` (2482 tris)  | 248 µs  | 200 µs  | 542 µs  | 203 µs |
-| `fixtures/water-huge` (5174 tris, 192 holes) | 1.80 ms | 1.39 ms | 1.23 ms | 1.46 ms |
-| `fixtures/water-huge3` (15470 tris, 1443 holes) | 26.1 ms | 19.4 ms | 5.2 ms | 22.0 ms |
-| `star/16` points        | 0.99 µs    | 0.70 µs | 3.8 µs | 0.6 µs |
-| `star/4096` points      | 16.6 ms    | 13.0 ms | 41 ms  | 14.8 ms |
-| `star/65536` points     | 4.6 s      | 3.4 s   | 9.9 s  | 4.3 s |
-| `holes/64` (8×8 grid)   | 66 µs      | 50 µs   | 27 µs  | 44 µs |
-| `holes/1024` (32×32 grid) | 11.3 ms  | 8.0 ms  | 0.68 ms | 7.5 ms |
+| Benchmark | rearcut | earcut-rs | lyon | earcut.hpp |
+|---|---:|---:|---:|---:|
+| `fixtures/building` | 0.33 µs | 0.20 µs | 1.6 µs | 0.25 µs |
+| `fixtures/dude` | 5.7 µs | 4.7 µs | 8.6 µs | 4.1 µs |
+| `fixtures/bad-hole` | 3.0 µs | 2.3 µs | 4.5 µs | 2.3 µs |
+| `fixtures/water` | 248 µs | 200 µs | 542 µs | 203 µs |
+| `fixtures/water-huge` | 1.80 ms | 1.39 ms | 1.23 ms | 1.46 ms |
+| `fixtures/water-huge3` | 26.1 ms | 19.4 ms | 5.2 ms | 22.0 ms |
+| `star/16` | 0.99 µs | 0.70 µs | 3.8 µs | 0.6 µs |
+| `star/4096` | 16.6 ms | 13.0 ms | 41 ms | 14.8 ms |
+| `star/65536` | 4.6 s | 3.4 s | 9.9 s | 4.3 s |
+| `holes/64` | 66 µs | 50 µs | 27 µs | 44 µs |
+| `holes/1024` | 11.3 ms | 8.0 ms | 0.68 ms | 7.5 ms |
 
 **Takeaway:** for simple-to-moderately-complex polygons, and especially for
 concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
@@ -135,31 +121,6 @@ shows the same effect there (44 µs / 7.5 ms), and lyon's sweep-line approach
 is fastest of all on this shape of workload. In short: the block index is a
 genuine win for realistic hole-heavy polygons (many vertices per hole), and
 roughly neutral-to-slightly-negative for degenerate microscopic-hole grids.
-
-**Honest note on `earcut-rs`:** the [georust/earcut](https://github.com/georust/earcut)
-crate is, at the time of writing, consistently the fastest of the four across
-nearly every benchmark here — often beating even `earcut.hpp` (its README
-reports the same result against the C++ reference). It uses a very similar
-arena-of-nodes design to `rearcut`, but goes further: packed `Node` fields
-(vertex index and Steiner-point flag share a `u32` via a bit flag), byte
-offsets instead of element indices for node links (avoiding a multiply on
-every dereference), and pre-sized buffers reused across calls via a stateful
-`Earcut` struct. `rearcut` remains a solid, simple, from-scratch port with
-its own optimizations (see below), but if raw throughput is the only
-priority, `earcut-rs` is worth a look.
-
-The arena's internal node links (`prev`/`next`/`prev_z`/`next_z`) are stored
-as `u32` rather than `usize`, shrinking each `Node` from 64 to 48 bytes
-(matching or beating earcut.hpp's raw-pointer-based C++ `Node`), and arena
-lookups use `get_unchecked` internally (indices are always either the `NULL`
-sentinel or values returned by the arena itself, so bounds checks are
-provably redundant and are asserted only in debug builds). Combined with
-pre-reserving the output triangle buffer and using unstable sorts for the
-hole-bridge queue and z-order curve, this closed most of the earlier gap on
-node-traversal-heavy workloads: `star/65536` went from 1.17x to ~1.07x of
-`earcut.hpp`'s time, and `fixtures/building` from 1.8x to ~1.3x. The
-`holes` benchmark's gap is largely unaffected, since it's dominated by
-hole-bridge search cost rather than node traversal.
 
 ## Acknowledgements
 

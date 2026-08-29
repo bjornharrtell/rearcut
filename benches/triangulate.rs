@@ -9,7 +9,7 @@
 //!           compiler, invoked via `cc` in build.rs)
 //! HTML report: `target/criterion/report/index.html`
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use earcut::Earcut as GeorustEarcut;
 use lyon::math::point;
 use lyon::path::Path;
