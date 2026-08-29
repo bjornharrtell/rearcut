@@ -117,14 +117,17 @@ fn grid_with_holes(holes_per_side: usize) -> Vec<Vec<[f64; 2]>> {
 
 /// Triangulates with a caller-provided, reused `rearcut::Earcut` and output buffer, so
 /// repeated calls (as in a `b.iter` loop) measure steady-state performance without paying
-/// for a fresh arena allocation every time.
+/// for a fresh arena allocation every time. `vertices`/`holes` are pre-flattened once
+/// outside the timing loop (mirroring how `earcut-rs` reads directly from existing ring
+/// data with no separate flatten step), so only the triangulation itself is measured.
 fn rearcut_triangulate(
     earcutter: &mut rearcut::Earcut,
     triangles: &mut Vec<u32>,
-    rings: &[Vec<[f64; 2]>],
+    vertices: &[f64],
+    holes: &[usize],
+    dim: usize,
 ) -> usize {
-    let (vertices, holes, dim) = rearcut::flatten(rings);
-    earcutter.earcut_into(&vertices, &holes, dim, triangles);
+    earcutter.earcut_into(vertices, holes, dim, triangles);
     triangles.len()
 }
 
@@ -195,17 +198,24 @@ fn bench_fixtures(c: &mut Criterion) {
         let vertex_count: usize = rings.iter().map(|r| r.len()).sum();
         group.throughput(Throughput::Elements(vertex_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("rearcut", name), &rings, |b, rings| {
-            let mut earcutter = rearcut::Earcut::new();
-            let mut triangles = Vec::new();
-            b.iter(|| {
-                black_box(rearcut_triangulate(
-                    &mut earcutter,
-                    &mut triangles,
-                    black_box(rings),
-                ))
-            });
-        });
+        let (rearcut_vertices, rearcut_holes, rearcut_dim) = rearcut::flatten(&rings);
+        group.bench_with_input(
+            BenchmarkId::new("rearcut", name),
+            &(rearcut_vertices, rearcut_holes, rearcut_dim),
+            |b, (vertices, holes, dim)| {
+                let mut earcutter = rearcut::Earcut::new();
+                let mut triangles = Vec::new();
+                b.iter(|| {
+                    black_box(rearcut_triangulate(
+                        &mut earcutter,
+                        &mut triangles,
+                        black_box(vertices),
+                        black_box(holes),
+                        *dim,
+                    ))
+                });
+            },
+        );
         group.bench_with_input(BenchmarkId::new("earcut-rs", name), &rings, |b, rings| {
             let mut earcutter = GeorustEarcut::new();
             let mut triangles = Vec::new();
@@ -247,17 +257,24 @@ fn bench_stars(c: &mut Criterion) {
         let rings = star(points, 100.0, 40.0);
         group.throughput(Throughput::Elements(points as u64 * 2));
 
-        group.bench_with_input(BenchmarkId::new("rearcut", points), &rings, |b, rings| {
-            let mut earcutter = rearcut::Earcut::new();
-            let mut triangles = Vec::new();
-            b.iter(|| {
-                black_box(rearcut_triangulate(
-                    &mut earcutter,
-                    &mut triangles,
-                    black_box(rings),
-                ))
-            });
-        });
+        let (rearcut_vertices, rearcut_holes, rearcut_dim) = rearcut::flatten(&rings);
+        group.bench_with_input(
+            BenchmarkId::new("rearcut", points),
+            &(rearcut_vertices, rearcut_holes, rearcut_dim),
+            |b, (vertices, holes, dim)| {
+                let mut earcutter = rearcut::Earcut::new();
+                let mut triangles = Vec::new();
+                b.iter(|| {
+                    black_box(rearcut_triangulate(
+                        &mut earcutter,
+                        &mut triangles,
+                        black_box(vertices),
+                        black_box(holes),
+                        *dim,
+                    ))
+                });
+            },
+        );
         group.bench_with_input(BenchmarkId::new("earcut-rs", points), &rings, |b, rings| {
             let mut earcutter = GeorustEarcut::new();
             let mut triangles = Vec::new();
@@ -300,17 +317,20 @@ fn bench_holes(c: &mut Criterion) {
         let hole_count = holes_per_side * holes_per_side;
         group.throughput(Throughput::Elements(hole_count as u64));
 
+        let (rearcut_vertices, rearcut_holes, rearcut_dim) = rearcut::flatten(&rings);
         group.bench_with_input(
             BenchmarkId::new("rearcut", hole_count),
-            &rings,
-            |b, rings| {
+            &(rearcut_vertices, rearcut_holes, rearcut_dim),
+            |b, (vertices, holes, dim)| {
                 let mut earcutter = rearcut::Earcut::new();
                 let mut triangles = Vec::new();
                 b.iter(|| {
                     black_box(rearcut_triangulate(
                         &mut earcutter,
                         &mut triangles,
-                        black_box(rings),
+                        black_box(vertices),
+                        black_box(holes),
+                        *dim,
                     ))
                 });
             },
