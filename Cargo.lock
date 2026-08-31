@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "rearcut"
-version = "3.2.3"
+version = "1.0.0"
 dependencies = [
  "cc",
  "criterion",
