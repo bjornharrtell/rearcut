@@ -137,18 +137,23 @@ struct Arena {
     /// Block-bbox index for `find_hole_bridge` (ported from earcut.hpp issue #183 fix): one
     /// `[min_x, min_y, max_x, max_y]` bbox per `BLOCK_SIZE` consecutive ring edges, so the
     /// leftward-ray scan can skip whole blocks in O(1) instead of walking the whole merged
-    /// ring. Grown append-only: the outer ring seeds it, then each merged hole appends a
-    /// segment (head node, stop node, blocks over head..stop). Buffers are reused/grown
-    /// across calls.
+    /// ring. Grown append-only: the outer ring seeds it, then each merged hole appends its
+    /// own blocks. Buffers are reused/grown across calls.
+    ///
+    /// Each block owns an explicit list of node handles (`block_nodes[block_start[b]..
+    /// block_start[b + 1]]`) rather than a ring range, because merging a hole splices a whole
+    /// new ring run into the middle of an already-indexed block's range — so a range-based
+    /// block would have to re-walk those nodes (which its own blocks already cover) on every
+    /// later query. With explicit lists each block stays bounded by `BLOCK_SIZE`.
     ///
     /// `filter_points` only drops collinear/coincident points, so a stale bbox stays a
     /// conservative superset of its live edges (never a false skip); the scan skips dead
-    /// nodes (`p.prev.next != p`) and lazily advances a dead head/stop. Blocks are scanned in
-    /// append (not ring) order, so the chosen bridge can differ from the un-indexed scan — a
-    /// different but equally valid result.
+    /// nodes (`p.prev.next != p`). Blocks are scanned in append (not ring) order, so the
+    /// chosen bridge can differ from an un-indexed scan — a different but equally valid
+    /// result.
     block_bbox: Vec<f64>,
-    block_head: Vec<u32>,
-    block_stop: Vec<u32>,
+    block_nodes: Vec<u32>,
+    block_start: Vec<u32>,
     num_blocks: usize,
     /// true only while `eliminate_holes` merges holes, so `remove_node` keeps the block
     /// index live (via `grow_block`)
@@ -166,8 +171,8 @@ impl Arena {
             nodes: Vec::with_capacity(capacity),
             filtered_out: false,
             block_bbox: Vec::new(),
-            block_head: Vec::new(),
-            block_stop: Vec::new(),
+            block_nodes: Vec::new(),
+            block_start: Vec::new(),
             num_blocks: 0,
             index_active: false,
             z_order_buf: Vec::new(),
@@ -288,22 +293,20 @@ impl Arena {
         if self.block_bbox.len() < max_blocks * 4 {
             self.block_bbox.resize(max_blocks * 4, 0.0);
         }
-        if self.block_head.len() < max_blocks {
-            self.block_head.resize(max_blocks, NULL);
-            self.block_stop.resize(max_blocks, NULL);
-        }
         self.num_blocks = 0;
+        self.block_nodes.clear();
+        self.block_start.clear();
+        self.block_start.push(0);
     }
 
     /// index the ring run `head..stop` (exclusive) as `ceil(len / BLOCK_SIZE)` blocks; `head
-    /// == stop` means the whole ring. Each block's bbox covers both endpoints of every edge it
-    /// owns.
+    /// == stop` means the whole ring. Each block records the nodes it owns and a bbox
+    /// covering both endpoints of every edge those nodes start.
     fn index_segment(&mut self, head: u32, stop: u32) {
         let mut p = head;
         loop {
             let b = self.num_blocks;
             self.num_blocks += 1;
-            self.block_head[b] = p;
             let mut b_min_x = f64::INFINITY;
             let mut b_min_y = f64::INFINITY;
             let mut b_max_x = f64::NEG_INFINITY;
@@ -313,6 +316,7 @@ impl Arena {
                 let c = self.get(p).next; // edge p->c; bbox must bound both endpoints
                 // reuse z as the owning block during eliminate_holes (see grow_block)
                 self.get_mut(p).z = b as i32;
+                self.block_nodes.push(p);
                 let (px, py) = (self.get(p).x, self.get(p).y);
                 let (cx, cy) = (self.get(c).x, self.get(c).y);
                 b_min_x = b_min_x.min(px).min(cx);
@@ -325,7 +329,7 @@ impl Arena {
                     break;
                 }
             }
-            self.block_stop[b] = p;
+            self.block_start.push(self.block_nodes.len() as u32);
             let g = b * 4;
             self.block_bbox[g] = b_min_x;
             self.block_bbox[g + 1] = b_min_y;
@@ -363,22 +367,16 @@ impl Arena {
     /// node. For the single full-ring seed block (`head == stop`) the same forward advance
     /// keeps them equal, so the loop still laps the whole ring instead of collapsing to an
     /// empty walk.
-    fn live_block_head(&mut self, b: usize) -> u32 {
-        let mut head = self.block_head[b];
-        while self.get(self.get(head).prev).next != head {
-            head = self.get(head).next;
-        }
-        self.block_head[b] = head;
-        head
+    #[inline]
+    fn block_range(&self, b: usize) -> std::ops::Range<usize> {
+        self.block_start[b] as usize..self.block_start[b + 1] as usize
     }
 
-    fn live_block_stop(&mut self, b: usize) -> u32 {
-        let mut stop = self.block_stop[b];
-        while self.get(self.get(stop).prev).next != stop {
-            stop = self.get(stop).next;
-        }
-        self.block_stop[b] = stop;
-        stop
+    /// a node is live while its ring neighbours still point back at it; `remove_node` leaves
+    /// removed nodes' own links intact, so stale index entries are detected this way
+    #[inline]
+    fn is_live(&self, p: u32) -> bool {
+        self.get(self.get(p).prev).next == p
     }
 
     #[inline]
@@ -985,10 +983,9 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
         }
 
         // ensure the walk's exclusive bound is live so we don't overrun into other blocks
-        let stop = arena.live_block_stop(b);
-        let mut p = arena.live_block_head(b);
-        loop {
-            if arena.get(arena.get(p).prev).next == p {
+        for i in arena.block_range(b) {
+            let p = arena.block_nodes[i];
+            if arena.is_live(p) {
                 // skip nodes removed by filter_points (stale in the index)
                 let p_next = arena.get(p).next;
                 if arena.equals(hole, p_next) {
@@ -1007,10 +1004,6 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
                         }
                     }
                 }
-            }
-            p = arena.get(p).next;
-            if p == stop {
-                break;
             }
         }
         b += 1;
@@ -1046,11 +1039,10 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
             continue;
         }
 
-        let stop = arena.live_block_stop(b);
-        let mut p = arena.live_block_head(b);
-        loop {
+        for i in arena.block_range(b) {
+            let p = arena.block_nodes[i];
             let (px, py) = (arena.get(p).x, arena.get(p).y);
-            if arena.get(arena.get(p).prev).next == p // skip dead nodes
+            if arena.is_live(p) // skip nodes removed by filter_points
                 && hx >= px
                 && px >= mx
                 && hx != px
@@ -1081,11 +1073,6 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
                     m = p;
                     tan_min = tan;
                 }
-            }
-
-            p = arena.get(p).next;
-            if p == stop {
-                break;
             }
         }
         b += 1;
