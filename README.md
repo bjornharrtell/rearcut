@@ -110,32 +110,47 @@ their reusable `Earcut` struct so repeated calls don't pay for a fresh
 arena each time; `lyon` and `earcut.hpp` have no such API and are measured
 one-shot.)
 
-| Benchmark | rearcut | earcut-rs | lyon | earcut.hpp |
+| Benchmark | rearcut | earcut-rs | earcut.hpp | lyon |
 |---|---:|---:|---:|---:|
-| `fixtures/building` | 0.16 µs | 0.17 µs | 1.4 µs | 0.25 µs |
-| `fixtures/dude` | 4.1 µs | 4.4 µs | 8.6 µs | 4.2 µs |
-| `fixtures/bad-hole` | 1.9 µs | 2.1 µs | 4.7 µs | 2.3 µs |
-| `fixtures/water` | 177 µs | 191 µs | 537 µs | 193 µs |
-| `fixtures/water-huge` | 1.46 ms | 1.36 ms | 1.22 ms | 1.48 ms |
-| `fixtures/water-huge3` | 21.1 ms | 19.1 ms | 5.8 ms | 21.3 ms |
-| `star/16` | 0.53 µs | 0.58 µs | 3.8 µs | 0.60 µs |
-| `star/4096` | 12.4 ms | 12.3 ms | 41 ms | 15.2 ms |
-| `star/65536` | 3.46 s | 3.37 s | 11.2 s | 4.3 s |
-| `holes/64` | 46 µs | 47 µs | 26 µs | 44 µs |
-| `holes/1024` | 8.0 ms | 7.8 ms | 0.74 ms | 7.4 ms |
+| `fixtures/building` | 141 ns | 151 ns | 250 ns | 1.37 µs |
+| `fixtures/dude` | 4.07 µs | 4.00 µs | 3.99 µs | 8.39 µs |
+| `fixtures/bad-hole` | 1.77 µs | 1.90 µs | 2.05 µs | 4.27 µs |
+| `fixtures/water3b` | 858 ns | 869 ns | 1.02 µs | 2.52 µs |
+| `fixtures/water4` | 45.5 µs | 47.4 µs | 47.1 µs | 64.2 µs |
+| `fixtures/water2` | 155 µs | 135 µs | 158 µs | 115 µs |
+| `fixtures/water` | 167 µs | 171 µs | 195 µs | 513 µs |
+| `fixtures/water-huge` | 1.34 ms | 1.33 ms | 1.45 ms | 1.21 ms |
+| `fixtures/water-huge3` | 19.1 ms | 18.6 ms | 21.0 ms | 4.85 ms |
+| `star/16` | 555 ns | 536 ns | 572 ns | 3.45 µs |
+| `star/256` | 47.9 µs | 51.6 µs | 47.1 µs | 180 µs |
+| `star/4096` | 11.8 ms | 12.2 ms | 14.4 ms | 32.8 ms |
+| `star/65536` | 3.55 s | 3.73 s | 4.68 s | 8.16 s |
+| `holes/4` | 669 ns | 731 ns | 905 ns | 2.05 µs |
+| `holes/64` | 22.9 µs | 45.3 µs | 43.0 µs | 25.5 µs |
+| `holes/256` | 189 µs | 618 µs | 632 µs | 115 µs |
+| `holes/1024` | 2.18 ms | 8.31 ms | 7.83 ms | 609 µs |
 
-**Takeaway:** for simple-to-moderately-complex polygons, and especially for
-concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
-is consistently 2–4x faster than lyon's sweep-line tessellator. Against
-`earcut-rs` (georust's independent port), `rearcut` now wins or ties on
-most benchmarks — after switching node handles to precomputed byte
-offsets (like `earcut-rs`'s `NodeOffset`), avoiding a stride multiply on
-every node dereference — with a small remaining gap (~2–11%) only on a
-few of the largest inputs (`water-huge`, `water-huge3`, `water2`). The
-`holes` benchmark's small, uniform-size synthetic holes are a weaker case
-for both crates' block-bbox hole-bridge index than realistic many-vertex
-holes (see `fixtures/water-huge3`), which is why lyon's sweep-line
-approach wins there despite losing everywhere else.
+**Takeaway:** `rearcut` is at or near parity with `earcut-rs` and
+`earcut.hpp` on typical inputs, and pulls ahead as size or hole count
+grows: ~5% faster than `earcut-rs` on `star/65536`, and ~4x faster than
+both on the many-hole `holes/1024` grid. The main structural change
+behind that is the hole-bridge index: each block gets an explicit node
+list rather than a ring range, so a block's scan cost stays bounded by
+its own size even after `split_polygon` splices a hole into the middle
+of it — this is a strict win with no trade-off, since it never scans
+more per block than it did before.
+
+Against lyon's sweep-line tessellator, ear clipping wins by 2–5x on
+concave, hole-free polygons (`star`) and on fixtures with a few large
+holes, but loses on inputs with very many small holes (`holes/1024`,
+`water-huge3`) — a sweep line is simply the better asymptotic fit there.
+
+Note that `.cargo/config.toml` builds with `-C target-cpu=native` (and
+`build.rs` passes `-march=native` to `earcut.hpp`), so these numbers are
+for host-tuned builds of every implementation. It is worth a few percent
+on the `star` cases. It applies to builds run from inside this
+repository only, and is not inherited by crates that depend on a
+published `rearcut`.
 
 ## Acknowledgements
 

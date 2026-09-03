@@ -1,0 +1,9 @@
+# Build for the host CPU. Worth 3-5% on the `star` benchmarks. Note that this is *not* from
+# vectorizing the z-order box filter: that stays scalar (`vucomisd`) even with AVX available,
+# because the filter's comparisons feed a boolean reduction LLVM will not pack. Widening it
+# would take explicit SIMD intrinsics with a runtime feature check.
+#
+# This applies to builds run from inside this repository — local development and the
+# benchmarks — and is not inherited by crates depending on a published `rearcut`.
+[build]
+rustflags = ["-C", "target-cpu=native"]
