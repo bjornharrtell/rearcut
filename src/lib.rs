@@ -70,7 +70,7 @@ impl_earcut_index!(u16, u32, u64, usize);
 const STEINER_BIT: u32 = 1 << 31;
 const INDEX_MASK: u32 = !STEINER_BIT;
 
-// `Node` is kept as small as possible (32 bytes, 8-byte aligned) so large rings fit more
+// `Node` is kept as small as possible (40 bytes, 8-byte aligned) so large rings fit more
 // nodes per cache line: the steiner flag is packed into the top bit of the vertex index
 // (mirrors upstream's `i_steiner` trick) instead of a separate `bool` field, and the vertex
 // index itself is `u32` (an input with more than u32::MAX vertices would already exhaust
@@ -80,16 +80,16 @@ struct Node {
     /// original vertex index in the input coordinates array (lower 31 bits) + steiner flag
     /// (bit 31)
     i_steiner: u32,
-    /// Scratch handle into whichever acceleration index is currently live: the owning block
-    /// of the hole-bridge block index while holes are merged (see `Arena::index_segment`),
-    /// then the node's slot in the z-order index while ears are clipped (see `ZIndex`).
-    /// `NULL` until first assigned.
-    slot: u32,
+    /// z-order curve value
+    z: i32,
     x: f64,
     y: f64,
     /// previous and next vertex nodes in a polygon ring
     prev: u32,
     next: u32,
+    /// previous and next nodes in z-order (NULL if none)
+    prev_z: u32,
+    next_z: u32,
 }
 
 impl Node {
@@ -101,7 +101,9 @@ impl Node {
             y,
             prev: NULL,
             next: NULL,
-            slot: NULL,
+            z: 0,
+            prev_z: NULL,
+            next_z: NULL,
         }
     }
 
@@ -123,118 +125,6 @@ impl Node {
 
 /// edges per block in the hole-bridge block-bbox index (see `Arena::build_block_index`)
 const BLOCK_SIZE: i32 = 16;
-
-/// entries tested per pass of the z-order scan's branchless bounding-box filter
-const Z_CHUNK: usize = 8;
-
-/// The z-order (Morton curve) index over a ring's nodes, sorted by z, used by
-/// `is_ear_hashed` to look at only the nodes whose z can place them inside an ear
-/// candidate's bounding box.
-///
-/// Held as parallel arrays rather than the doubly linked z-list of upstream earcut: the scan
-/// is a contiguous walk outwards from the ear's own slot, so it reads memory sequentially
-/// (and can reject `Z_CHUNK` entries at a time with a branchless filter) instead of chasing
-/// `prev_z`/`next_z` pointers through the arena. It also keeps `Node` two words smaller.
-///
-/// Removed nodes are tombstoned by writing NaN into `xs`, which fails every bounding-box
-/// comparison, so the scan needs no separate liveness test. The arrays are padded out to a
-/// whole number of chunks with tombstones (and `i32::MAX` z) so every chunk is full.
-#[derive(Default)]
-struct ZIndex {
-    xs: Vec<f64>,
-    ys: Vec<f64>,
-    zs: Vec<i32>,
-    nodes: Vec<u32>,
-    /// entries in use; `xs.len()` is this rounded up to a whole number of chunks
-    len: usize,
-    live: usize,
-}
-
-impl ZIndex {
-    fn clear(&mut self) {
-        self.xs.clear();
-        self.ys.clear();
-        self.zs.clear();
-        self.nodes.clear();
-        self.len = 0;
-        self.live = 0;
-    }
-
-    #[inline]
-    fn push(&mut self, z: i32, node: u32, x: f64, y: f64) {
-        self.xs.push(x);
-        self.ys.push(y);
-        self.zs.push(z);
-        self.nodes.push(node);
-        self.len += 1;
-    }
-
-    /// pad the trailing partial chunk with tombstones so every chunk can be tested whole
-    fn pad(&mut self) {
-        self.live = self.len;
-        while !self.xs.len().is_multiple_of(Z_CHUNK) {
-            self.xs.push(f64::NAN);
-            self.ys.push(f64::NAN);
-            self.zs.push(i32::MAX);
-            self.nodes.push(NULL);
-        }
-    }
-
-    #[inline]
-    fn chunks(&self) -> usize {
-        self.xs.len() / Z_CHUNK
-    }
-
-    /// worth compacting once most of the index is tombstones (and there is enough of it for
-    /// the compaction to pay for itself)
-    #[inline]
-    fn is_mostly_dead(&self) -> bool {
-        self.len > 64 && self.live * 2 < self.len
-    }
-
-    /// smallest z in chunk `c` (the arrays are z-sorted, so this is its first entry)
-    #[inline]
-    fn chunk_min_z(&self, c: usize) -> i32 {
-        self.zs[c * Z_CHUNK]
-    }
-
-    /// largest z in chunk `c`
-    #[inline]
-    fn chunk_max_z(&self, c: usize) -> i32 {
-        self.zs[c * Z_CHUNK + Z_CHUNK - 1]
-    }
-
-    /// Does any entry of chunk `c` lie in the box? Branchless and over a statically sized
-    /// window, so it is a short straight-line run of compares with a single branch at the
-    /// end. Tombstones hold NaN, which compares false against everything.
-    #[inline]
-    fn any_in_box(&self, c: usize, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
-        let lo = c * Z_CHUNK;
-        let xs = &self.xs[lo..lo + Z_CHUNK];
-        let ys = &self.ys[lo..lo + Z_CHUNK];
-        let mut any = false;
-        for i in 0..Z_CHUNK {
-            any |= (xs[i] >= x0) & (xs[i] <= x1) & (ys[i] >= y0) & (ys[i] <= y1);
-        }
-        any
-    }
-
-    /// Which entries of chunk `c` lie in the box, as one bit per entry. Building the mask
-    /// costs more than the plain `any_in_box` reduction, so the scan only asks for it once
-    /// `any_in_box` says there is something to find.
-    #[inline]
-    fn in_box(&self, c: usize, x0: f64, y0: f64, x1: f64, y1: f64) -> u32 {
-        let lo = c * Z_CHUNK;
-        let xs = &self.xs[lo..lo + Z_CHUNK];
-        let ys = &self.ys[lo..lo + Z_CHUNK];
-        let mut mask = 0u32;
-        for i in 0..Z_CHUNK {
-            let hit = (xs[i] >= x0) & (xs[i] <= x1) & (ys[i] >= y0) & (ys[i] <= y1);
-            mask |= (hit as u32) << i;
-        }
-        mask
-    }
-}
 
 /// Arena of nodes backing the doubly linked list(s) used by the algorithm.
 struct Arena {
@@ -269,11 +159,6 @@ struct Arena {
     /// index live (via `grow_block`)
     index_active: bool,
 
-    /// z-order index over the ring being clipped; empty (and inactive) until `index_curve`
-    /// builds it, which only happens for inputs large enough to be worth hashing
-    zindex: ZIndex,
-    z_active: bool,
-
     /// scratch buffers for `index_curve`/`sort_by_z`, reused across (possibly recursive,
     /// via `split_earcut`) calls to avoid a heap allocation each time.
     z_order_buf: Vec<(i32, u32)>,
@@ -290,8 +175,6 @@ impl Arena {
             block_start: Vec::new(),
             num_blocks: 0,
             index_active: false,
-            zindex: ZIndex::default(),
-            z_active: false,
             z_order_buf: Vec::new(),
             z_order_scratch: Vec::new(),
         }
@@ -306,19 +189,18 @@ impl Arena {
         self.filtered_out = false;
         self.num_blocks = 0;
         self.index_active = false;
-        self.zindex.clear();
-        self.z_active = false;
     }
 
-    /// `Node` is kept as small as possible (32 bytes, 8-byte aligned) so large rings fit more
-    /// nodes per cache line. Node "handles" (`prev`/`next`, and every `u32`
+    /// `Node` is kept as small as possible (40 bytes, 8-byte aligned) so large rings fit more
+    /// nodes per cache line. Node "handles" (`prev`/`next`/`prev_z`/`next_z`, and every `u32`
     /// returned by `create_node`/`insert_node`) are **byte offsets** into `Arena::nodes`'s
     /// backing storage, not element indices: `create_node` computes `index * NODE_SIZE` once
     /// when a node is created, and `Arena::get`/`get_mut` dereference via `byte_add` (a plain
     /// pointer add) instead of slice indexing, which would redo `idx * NODE_SIZE` and a
     /// bounds check on every single access. Both sit on the load-to-load dependency chain of
     /// a ring walk, so on small polygons — where that chain *is* the runtime — plain indexing
-    /// measures ~25% slower. This mirrors georust/earcut's `NodeOffset` design.
+    /// measures ~25% slower. This
+    /// mirrors georust/earcut's `NodeOffset` design.
     const NODE_SIZE: usize = std::mem::size_of::<Node>();
 
     #[inline]
@@ -366,31 +248,6 @@ impl Arena {
         unsafe { &mut *self.nodes.as_mut_ptr().byte_add(off as usize) }
     }
 
-    /// Drop tombstoned entries, keeping the surviving ones in z-order (which compaction
-    /// preserves, so this needs no re-sort) and repointing their nodes at their new slots.
-    fn compact_zindex(&mut self) {
-        let mut zi = std::mem::take(&mut self.zindex);
-        let mut w = 0;
-        for r in 0..zi.len {
-            if zi.xs[r].is_nan() {
-                continue;
-            }
-            zi.xs[w] = zi.xs[r];
-            zi.ys[w] = zi.ys[r];
-            zi.zs[w] = zi.zs[r];
-            zi.nodes[w] = zi.nodes[r];
-            self.get_mut(zi.nodes[w]).slot = w as u32;
-            w += 1;
-        }
-        zi.xs.truncate(w);
-        zi.ys.truncate(w);
-        zi.zs.truncate(w);
-        zi.nodes.truncate(w);
-        zi.len = w;
-        zi.pad();
-        self.zindex = zi;
-    }
-
     /// create a node and optionally link it with previous one (in a circular doubly linked list)
     fn insert_node(&mut self, i: u32, x: f64, y: f64, last: u32) -> u32 {
         let p = self.create_node(i, x, y);
@@ -409,24 +266,23 @@ impl Arena {
     }
 
     fn remove_node(&mut self, p: u32) {
-        let (prev, next, slot) = {
+        let (prev, next, prev_z, next_z) = {
             let n = self.get(p);
-            (n.prev, n.next, n.slot)
+            (n.prev, n.next, n.prev_z, n.next_z)
         };
         self.get_mut(next).prev = prev;
         self.get_mut(prev).next = next;
 
+        if prev_z != NULL {
+            self.get_mut(prev_z).next_z = next_z;
+        }
+        if next_z != NULL {
+            self.get_mut(next_z).prev_z = prev_z;
+        }
+
         // keep the hole-bridge index's block bboxes covering the healed prev->next edge
         if self.index_active {
             self.grow_block(prev, next);
-        }
-
-        // tombstone the node's z-order entry so the ear scan stops seeing it. Nodes created
-        // after the index was built (by `split_polygon`) have no slot yet; the `index_curve`
-        // that follows every split gives them one.
-        if self.z_active && slot != NULL {
-            self.zindex.xs[slot as usize] = f64::NAN;
-            self.zindex.live -= 1;
         }
     }
 
@@ -460,8 +316,8 @@ impl Arena {
             let mut k: i32 = 0;
             loop {
                 let c = self.get(p).next; // edge p->c; bbox must bound both endpoints
-                // slot holds the owning block during eliminate_holes (see grow_block)
-                self.get_mut(p).slot = b as u32;
+                // reuse z as the owning block during eliminate_holes (see grow_block)
+                self.get_mut(p).z = b as i32;
                 self.block_nodes.push(p);
                 let (px, py) = (self.get(p).x, self.get(p).y);
                 let (cx, cy) = (self.get(c).x, self.get(c).y);
@@ -492,7 +348,7 @@ impl Arena {
     /// endpoint lived in another block; grow head's block bbox to cover tail so the
     /// leftward-ray prune can't false-skip it.
     fn grow_block(&mut self, head: u32, tail: u32) {
-        let g = self.get(head).slot as usize * 4;
+        let g = self.get(head).z as usize * 4;
         let (tx, ty) = (self.get(tail).x, self.get(tail).y);
         if tx < self.block_bbox[g] {
             self.block_bbox[g] = tx;
@@ -794,7 +650,7 @@ fn earcut_linked<N: EarcutIndex>(
     min_y: f64,
     inv_size: f64,
 ) {
-    // build the z-order index over this ring
+    // interlink polygon nodes in z-order
     if inv_size != 0.0 {
         index_curve(arena, ear, min_x, min_y, inv_size);
     }
@@ -830,12 +686,6 @@ fn earcut_linked<N: EarcutIndex>(
 
             ear = next;
             stop = next;
-
-            // the scan cost follows the index's length, not the ring's, so drop tombstones
-            // once most of it is dead
-            if arena.zindex.is_mostly_dead() {
-                arena.compact_zindex();
-            }
             continue;
         }
 
@@ -903,122 +753,60 @@ fn is_ear(arena: &Arena, ear: u32) -> bool {
     true
 }
 
-/// An ear candidate: its triangle `a`-`b`-`c` and that triangle's bounding box, as tested
-/// against the z-order index by `is_ear_hashed`.
-struct EarQuery {
-    ear: u32,
-    c: u32,
-    ax: f64,
-    ay: f64,
-    bx: f64,
-    by: f64,
-    cx: f64,
-    cy: f64,
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-/// Same test as `is_ear`, but only against the nodes the z-order index can place inside the
-/// candidate triangle's bounding box, instead of the whole remaining ring.
-///
-/// A Morton code is monotone in both coordinates, so every node inside the box has a z in
-/// `[min_z, max_z]`; the index is sorted by z, so those nodes sit in a contiguous run around
-/// the ear's own slot and the scan can stop as soon as a chunk falls entirely outside it.
-/// (Chunks straddling an end are still tested whole — harmless, since an entry outside the z
-/// range is outside the box too.)
 fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64) -> bool {
-    let (a, c, bx, by, slot) = {
-        let n = arena.get(ear);
-        (n.prev, n.next, n.x, n.y, n.slot as usize)
-    };
-    let (ax, ay) = arena.xy(a);
-    let (cx, cy) = arena.xy(c);
+    let a = arena.get(ear).prev;
+    let b = ear;
+    let c = arena.get(ear).next;
 
-    let q = EarQuery {
-        ear,
-        c,
-        ax,
-        ay,
-        bx,
-        by,
-        cx,
-        cy,
-        x0: ax.min(bx).min(cx),
-        y0: ay.min(by).min(cy),
-        x1: ax.max(bx).max(cx),
-        y1: ay.max(by).max(cy),
-    };
+    let (ax, ay) = (arena.get(a).x, arena.get(a).y);
+    let (bx, by) = (arena.get(b).x, arena.get(b).y);
+    let (cx, cy) = (arena.get(c).x, arena.get(c).y);
 
-    let min_z = z_order(q.x0, q.y0, min_x, min_y, inv_size);
-    let max_z = z_order(q.x1, q.y1, min_x, min_y, inv_size);
+    let x0 = ax.min(bx).min(cx);
+    let y0 = ay.min(by).min(cy);
+    let x1 = ax.max(bx).max(cx);
+    let y1 = ay.max(by).max(cy);
 
-    let zi = &arena.zindex;
-    let home = slot / Z_CHUNK;
+    let min_z = z_order(x0, y0, min_x, min_y, inv_size);
+    let max_z = z_order(x1, y1, min_x, min_y, inv_size);
 
-    if scan_chunk(arena, home, &q) {
-        return false;
-    }
-
-    // walk outwards from the ear's own chunk in both directions
-    let mut c = home;
-    while c > 0 {
-        c -= 1;
-        if zi.chunk_max_z(c) < min_z {
-            break;
-        }
-        if scan_chunk(arena, c, &q) {
+    let mut p = arena.get(ear).prev_z;
+    while p != NULL && arena.get(p).z >= min_z {
+        let pn = arena.get(p);
+        let (px, py) = (pn.x, pn.y);
+        if p != c
+            && px >= x0
+            && px <= x1
+            && py >= y0
+            && py <= y1
+            && !(ax == px && ay == py)
+            && point_in_triangle(ax, ay, bx, by, cx, cy, px, py)
+            && arena.area(arena.get(p).prev, p, arena.get(p).next) >= 0.0
+        {
             return false;
         }
+        p = arena.get(p).prev_z;
     }
 
-    let mut c = home;
-    while c + 1 < zi.chunks() {
-        c += 1;
-        if zi.chunk_min_z(c) > max_z {
-            break;
-        }
-        if scan_chunk(arena, c, &q) {
+    let mut n = arena.get(ear).next_z;
+    while n != NULL && arena.get(n).z <= max_z {
+        let nn = arena.get(n);
+        let (nx, ny) = (nn.x, nn.y);
+        if n != c
+            && nx >= x0
+            && nx <= x1
+            && ny >= y0
+            && ny <= y1
+            && !(ax == nx && ay == ny)
+            && point_in_triangle(ax, ay, bx, by, cx, cy, nx, ny)
+            && arena.area(arena.get(n).prev, n, arena.get(n).next) >= 0.0
+        {
             return false;
         }
+        n = arena.get(n).next_z;
     }
 
     true
-}
-
-/// Does any node in z-index chunk `c` sit inside the ear's triangle while being reflex (so
-/// that clipping the ear would swallow it)?
-fn scan_chunk(arena: &Arena, c: usize, q: &EarQuery) -> bool {
-    let zi = &arena.zindex;
-    if !zi.any_in_box(c, q.x0, q.y0, q.x1, q.y1) {
-        return false;
-    }
-    // most chunks stop above; the ones that do not are worth locating exactly, so the loop
-    // below touches only the entries that are actually in the box
-    let mut mask = zi.in_box(c, q.x0, q.y0, q.x1, q.y1);
-    while mask != 0 {
-        let j = c * Z_CHUNK + mask.trailing_zeros() as usize;
-        mask &= mask - 1;
-        let p = zi.nodes[j];
-        let (px, py) = (zi.xs[j], zi.ys[j]);
-        // `a` is excluded by coordinate (a duplicate of it is just as harmless)
-        if p == q.ear
-            || p == q.c
-            || (q.ax == px && q.ay == py)
-            || !point_in_triangle(q.ax, q.ay, q.bx, q.by, q.cx, q.cy, px, py)
-        {
-            continue;
-        }
-        let (p_prev, p_next) = {
-            let n = arena.get(p);
-            (n.prev, n.next)
-        };
-        if arena.area_at(p_prev, px, py, p_next) >= 0.0 {
-            return true;
-        }
-    }
-    false
 }
 
 /// go through all polygon nodes and cure small local self-intersections
@@ -1322,42 +1110,37 @@ fn sector_contains_sector(arena: &Arena, m: u32, p: u32) -> bool {
         && arena.area(arena.get(p).next, m, arena.get(m).next) < 0.0
 }
 
-/// (Re)build the z-order index over the ring starting at `start`: collect each node's Morton
-/// code, sort by it, and record the sorted arrays plus each node's slot in them.
+/// interlink polygon nodes in z-order: collect into a vec, sort by z, relink
 fn index_curve(arena: &mut Arena, start: u32, min_x: f64, min_y: f64, inv_size: f64) {
-    // reuse the arena's scratch Vecs across calls (avoids a heap allocation per
-    // `index_curve` invocation, which recurses through `split_earcut`)
-    let mut order = std::mem::take(&mut arena.z_order_buf);
-    let mut scratch = std::mem::take(&mut arena.z_order_scratch);
-
-    order.clear();
+    arena.z_order_buf.clear();
     let mut p = start;
     loop {
-        let n = arena.get(p);
-        order.push((z_order(n.x, n.y, min_x, min_y, inv_size), p));
-        p = n.next;
+        let (x, y) = (arena.get(p).x, arena.get(p).y);
+        let z = z_order(x, y, min_x, min_y, inv_size);
+        arena.get_mut(p).z = z;
+        arena.z_order_buf.push((z, p));
+        p = arena.get(p).next;
         if p == start {
             break;
         }
     }
 
+    // reuse the arena's scratch Vecs across calls (avoids a heap allocation per
+    // `index_curve` invocation, which recurses through `split_earcut`)
+    let mut order = std::mem::take(&mut arena.z_order_buf);
+    let mut scratch = std::mem::take(&mut arena.z_order_scratch);
     sort_by_z(&mut order, &mut scratch);
 
-    let mut zi = std::mem::take(&mut arena.zindex);
-    zi.clear();
-    zi.xs.reserve(order.len() + Z_CHUNK);
-    zi.ys.reserve(order.len() + Z_CHUNK);
-    zi.zs.reserve(order.len() + Z_CHUNK);
-    zi.nodes.reserve(order.len() + Z_CHUNK);
-    for (slot, &(z, node)) in order.iter().enumerate() {
-        let n = arena.get(node);
-        zi.push(z, node, n.x, n.y);
-        arena.get_mut(node).slot = slot as u32;
+    let mut prev: u32 = NULL;
+    for &(_, node) in order.iter() {
+        arena.get_mut(node).prev_z = prev;
+        if prev != NULL {
+            arena.get_mut(prev).next_z = node;
+        }
+        prev = node;
     }
-    zi.pad();
+    arena.get_mut(prev).next_z = NULL;
 
-    arena.zindex = zi;
-    arena.z_active = true;
     arena.z_order_buf = order;
     arena.z_order_scratch = scratch;
 }

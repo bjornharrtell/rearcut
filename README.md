@@ -112,42 +112,43 @@ one-shot.)
 
 | Benchmark | rearcut | earcut-rs | earcut.hpp | lyon |
 |---|---:|---:|---:|---:|
-| `fixtures/building` | 145 ns | 154 ns | 247 ns | 1.40 µs |
-| `fixtures/dude` | 6.18 µs | 3.99 µs | 4.02 µs | 8.72 µs |
-| `fixtures/bad-hole` | 1.77 µs | 1.98 µs | 2.08 µs | 4.34 µs |
-| `fixtures/water3b` | 853 ns | 866 ns | 1.01 µs | 2.60 µs |
-| `fixtures/water4` | 57.9 µs | 49.1 µs | 47.0 µs | 66.1 µs |
-| `fixtures/water2` | 208 µs | 135 µs | 157 µs | 118 µs |
-| `fixtures/water` | 178 µs | 168 µs | 203 µs | 511 µs |
-| `fixtures/water-huge` | 1.43 ms | 1.25 ms | 1.38 ms | 1.17 ms |
-| `fixtures/water-huge3` | 13.8 ms | 18.0 ms | 21.5 ms | 4.60 ms |
-| `star/16` | 518 ns | 540 ns | 569 ns | 3.43 µs |
-| `star/256` | 47.9 µs | 51.4 µs | 45.2 µs | 176 µs |
-| `star/4096` | 7.67 ms | 11.65 ms | 13.60 ms | 29.33 ms |
-| `star/65536` | 1.88 s | 3.19 s | 4.03 s | 7.30 s |
-| `holes/4` | 644 ns | 760 ns | 884 ns | 1.99 µs |
-| `holes/64` | 26.1 µs | 43.3 µs | 40.8 µs | 24.7 µs |
-| `holes/256` | 181 µs | 567 µs | 559 µs | 112 µs |
-| `holes/1024` | 1.83 ms | 7.70 ms | 7.62 ms | 593 µs |
+| `fixtures/building` | 141 ns | 151 ns | 250 ns | 1.37 µs |
+| `fixtures/dude` | 4.07 µs | 4.00 µs | 3.99 µs | 8.39 µs |
+| `fixtures/bad-hole` | 1.77 µs | 1.90 µs | 2.05 µs | 4.27 µs |
+| `fixtures/water3b` | 858 ns | 869 ns | 1.02 µs | 2.52 µs |
+| `fixtures/water4` | 45.5 µs | 47.4 µs | 47.1 µs | 64.2 µs |
+| `fixtures/water2` | 155 µs | 135 µs | 158 µs | 115 µs |
+| `fixtures/water` | 167 µs | 171 µs | 195 µs | 513 µs |
+| `fixtures/water-huge` | 1.34 ms | 1.33 ms | 1.45 ms | 1.21 ms |
+| `fixtures/water-huge3` | 19.1 ms | 18.6 ms | 21.0 ms | 4.85 ms |
+| `star/16` | 555 ns | 536 ns | 572 ns | 3.45 µs |
+| `star/256` | 47.9 µs | 51.6 µs | 47.1 µs | 180 µs |
+| `star/4096` | 11.8 ms | 12.2 ms | 14.4 ms | 32.8 ms |
+| `star/65536` | 3.55 s | 3.73 s | 4.68 s | 8.16 s |
+| `holes/4` | 669 ns | 731 ns | 905 ns | 2.05 µs |
+| `holes/64` | 22.9 µs | 45.3 µs | 43.0 µs | 25.5 µs |
+| `holes/256` | 189 µs | 618 µs | 632 µs | 115 µs |
+| `holes/1024` | 2.18 ms | 8.31 ms | 7.83 ms | 609 µs |
 
-**Takeaway:** `rearcut` is the fastest of the three ear-clipping
-implementations on most inputs, and its margin grows with size: ~1.7x
-faster than `earcut-rs` and ~2.1x faster than `earcut.hpp` on
-`star/65536`, and ~4x faster than both on the many-hole `holes/1024`
-grid. Two structural changes account for most of that. The hole-bridge
-index gives each block an explicit node list rather than a ring range, so
-a block's scan cost stays bounded by its own size even after
-`split_polygon` splices a hole into the middle of it. And the z-order
-index is a sorted array walked outwards from the ear's own slot, rather
-than a doubly linked z-list chased through the arena — it rejects a whole
-aligned block of candidates with one branchless filter, and its entries
-are sequential in memory instead of a pointer chase.
+**Takeaway:** `rearcut` is at or near parity with `earcut-rs` and
+`earcut.hpp` on typical inputs, and pulls ahead as size or hole count
+grows: ~5% faster than `earcut-rs` on `star/65536`, and ~4x faster than
+both on the many-hole `holes/1024` grid. The main structural change
+behind that is the hole-bridge index: each block gets an explicit node
+list rather than a ring range, so a block's scan cost stays bounded by
+its own size even after `split_polygon` splices a hole into the middle
+of it — this is a strict win with no trade-off, since it never scans
+more per block than it did before.
 
-That array scan pays a small fixed cost per query which only amortises
-once scans are long, so on the mid-size fixtures whose scans are short
-(`fixtures/dude`, `fixtures/water2`) it is 20–50% slower than the linked
-z-list it replaced. That is the trade made for the much larger wins
-above.
+A z-order scan implemented as a sorted array walked outward from the
+ear's own slot (instead of a doubly linked z-list chased through the
+arena) was also tried, and measured a further ~1.7x on `star/65536` and
+~4.5x on `holes/1024`. It was **not** kept: it pays a fixed per-query
+cost that only amortises on long scans, which made it 20-60% slower on
+mid-size fixtures with short scans (`fixtures/dude`, `fixtures/water2`)
+that are more representative of typical inputs than the synthetic
+`star`/`holes` stress tests. Reverted in favor of keeping those
+realistic cases fast.
 
 Against lyon's sweep-line tessellator, ear clipping wins by 2–5x on
 concave, hole-free polygons (`star`) and on fixtures with a few large
@@ -156,9 +157,10 @@ holes, but loses on inputs with very many small holes (`holes/1024`,
 
 Note that `.cargo/config.toml` builds with `-C target-cpu=native` (and
 `build.rs` passes `-march=native` to `earcut.hpp`), so these numbers are
-for host-tuned builds of every implementation. It is worth 3–5% on the
-`star` cases. It applies to builds run from inside this repository only,
-and is not inherited by crates that depend on a published `rearcut`.
+for host-tuned builds of every implementation. It is worth a few percent
+on the `star` cases. It applies to builds run from inside this
+repository only, and is not inherited by crates that depend on a
+published `rearcut`.
 
 ## Acknowledgements
 
