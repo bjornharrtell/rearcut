@@ -140,16 +140,6 @@ its own size even after `split_polygon` splices a hole into the middle
 of it — this is a strict win with no trade-off, since it never scans
 more per block than it did before.
 
-A z-order scan implemented as a sorted array walked outward from the
-ear's own slot (instead of a doubly linked z-list chased through the
-arena) was also tried, and measured a further ~1.7x on `star/65536` and
-~4.5x on `holes/1024`. It was **not** kept: it pays a fixed per-query
-cost that only amortises on long scans, which made it 20-60% slower on
-mid-size fixtures with short scans (`fixtures/dude`, `fixtures/water2`)
-that are more representative of typical inputs than the synthetic
-`star`/`holes` stress tests. Reverted in favor of keeping those
-realistic cases fast.
-
 Against lyon's sweep-line tessellator, ear clipping wins by 2–5x on
 concave, hole-free polygons (`star`) and on fixtures with a few large
 holes, but loses on inputs with very many small holes (`holes/1024`,
