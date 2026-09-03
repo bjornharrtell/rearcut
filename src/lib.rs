@@ -315,9 +315,10 @@ impl Arena {
     /// returned by `create_node`/`insert_node`) are **byte offsets** into `Arena::nodes`'s
     /// backing storage, not element indices: `create_node` computes `index * NODE_SIZE` once
     /// when a node is created, and `Arena::get`/`get_mut` dereference via `byte_add` (a plain
-    /// pointer add, no multiply) instead of slice indexing (which would redo `idx * NODE_SIZE`
-    /// — a non-power-of-two stride, so an actual multiply — on every single access). This
-    /// mirrors georust/earcut's `NodeOffset` design.
+    /// pointer add) instead of slice indexing, which would redo `idx * NODE_SIZE` and a
+    /// bounds check on every single access. Both sit on the load-to-load dependency chain of
+    /// a ring walk, so on small polygons — where that chain *is* the runtime — plain indexing
+    /// measures ~25% slower. This mirrors georust/earcut's `NodeOffset` design.
     const NODE_SIZE: usize = std::mem::size_of::<Node>();
 
     #[inline]
@@ -517,11 +518,18 @@ impl Arena {
         self.block_start[b] as usize..self.block_start[b + 1] as usize
     }
 
+    /// a node's coordinates
+    #[inline]
+    fn xy(&self, p: u32) -> (f64, f64) {
+        let n = self.get(p);
+        (n.x, n.y)
+    }
+
     /// a node is live while its ring neighbours still point back at it; `remove_node` leaves
     /// removed nodes' own links intact, so stale index entries are detected this way
     #[inline]
-    fn is_live(&self, p: u32) -> bool {
-        self.get(self.get(p).prev).next == p
+    fn is_live(&self, p: u32, prev: u32) -> bool {
+        self.get(prev).next == p
     }
 
     #[inline]
@@ -531,13 +539,21 @@ impl Arena {
         a.x == b.x && a.y == b.y
     }
 
+    /// `area`, for a middle vertex whose coordinates the caller already has
+    #[inline]
+    fn area_at(&self, p: u32, qx: f64, qy: f64, r: u32) -> f64 {
+        let p = self.get(p);
+        let r = self.get(r);
+        area_xy(p.x, p.y, qx, qy, r.x, r.y)
+    }
+
     /// signed area of a triangle
     #[inline]
     fn area(&self, p: u32, q: u32, r: u32) -> f64 {
         let p = self.get(p);
         let q = self.get(q);
         let r = self.get(r);
-        (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y)
+        area_xy(p.x, p.y, q.x, q.y, r.x, r.y)
     }
 }
 
@@ -740,21 +756,25 @@ fn filter_points(arena: &mut Arena, start: u32, end: Option<u32>) -> u32 {
     let mut again;
     loop {
         again = false;
-        let node = arena.get(p);
-        let (p_next, p_prev, steiner) = (node.next, node.prev, node.is_steiner());
-        if p != p_next
-            && !steiner
-            && (arena.equals(p, p_next) || arena.area(p_prev, p, p_next) == 0.0)
-        {
+        let (px, py, p_next, p_prev, steiner) = {
+            let n = arena.get(p);
+            (n.x, n.y, n.next, n.prev, n.is_steiner())
+        };
+        let degenerate = p != p_next && !steiner && {
+            // coincident with the next point, or collinear with both neighbours
+            let (nx, ny) = arena.xy(p_next);
+            (px == nx && py == ny) || arena.area_at(p_prev, px, py, p_next) == 0.0
+        };
+        if degenerate {
             if full || p == end {
-                end = arena.get(p).prev;
+                end = p_prev;
             }
             arena.filtered_out = true;
             arena.remove_node(p);
-            p = arena.get(p).prev;
+            p = p_prev;
             again = true;
         } else if full || p != end {
-            p = arena.get(p).next;
+            p = p_next;
             again = !full;
         }
         if !(again || p != end) {
@@ -784,15 +804,15 @@ fn earcut_linked<N: EarcutIndex>(
 
     // iterate through ears, slicing them one by one
     loop {
-        let (prev, next) = {
+        let (prev, next, ex, ey) = {
             let n = arena.get(ear);
-            (n.prev, n.next)
+            (n.prev, n.next, n.x, n.y)
         };
         if prev == next {
             break;
         }
 
-        if arena.area(prev, ear, next) < 0.0
+        if arena.area_at(prev, ex, ey, next) < 0.0
             && (if inv_size != 0.0 {
                 is_ear_hashed(arena, ear, min_x, min_y, inv_size)
             } else {
@@ -853,9 +873,9 @@ fn is_ear(arena: &Arena, ear: u32) -> bool {
     let b = ear;
     let c = arena.get(ear).next;
 
-    let (ax, ay) = (arena.get(a).x, arena.get(a).y);
-    let (bx, by) = (arena.get(b).x, arena.get(b).y);
-    let (cx, cy) = (arena.get(c).x, arena.get(c).y);
+    let (ax, ay) = arena.xy(a);
+    let (bx, by) = arena.xy(b);
+    let (cx, cy) = arena.xy(c);
 
     let x0 = ax.min(bx).min(cx);
     let y0 = ay.min(by).min(cy);
@@ -864,19 +884,21 @@ fn is_ear(arena: &Arena, ear: u32) -> bool {
 
     let mut p = arena.get(c).next;
     while p != a {
-        let pn = arena.get(p);
-        let (px, py) = (pn.x, pn.y);
+        let (px, py, p_prev, p_next) = {
+            let n = arena.get(p);
+            (n.x, n.y, n.prev, n.next)
+        };
         if px >= x0
             && px <= x1
             && py >= y0
             && py <= y1
             && !(ax == px && ay == py)
             && point_in_triangle(ax, ay, bx, by, cx, cy, px, py)
-            && arena.area(arena.get(p).prev, p, arena.get(p).next) >= 0.0
+            && arena.area_at(p_prev, px, py, p_next) >= 0.0
         {
             return false;
         }
-        p = arena.get(p).next;
+        p = p_next;
     }
     true
 }
@@ -907,12 +929,12 @@ struct EarQuery {
 /// (Chunks straddling an end are still tested whole — harmless, since an entry outside the z
 /// range is outside the box too.)
 fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64) -> bool {
-    let a = arena.get(ear).prev;
-    let c = arena.get(ear).next;
-
-    let (ax, ay) = (arena.get(a).x, arena.get(a).y);
-    let (bx, by) = (arena.get(ear).x, arena.get(ear).y);
-    let (cx, cy) = (arena.get(c).x, arena.get(c).y);
+    let (a, c, bx, by, slot) = {
+        let n = arena.get(ear);
+        (n.prev, n.next, n.x, n.y, n.slot as usize)
+    };
+    let (ax, ay) = arena.xy(a);
+    let (cx, cy) = arena.xy(c);
 
     let q = EarQuery {
         ear,
@@ -933,7 +955,7 @@ fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64)
     let max_z = z_order(q.x1, q.y1, min_x, min_y, inv_size);
 
     let zi = &arena.zindex;
-    let home = arena.get(ear).slot as usize / Z_CHUNK;
+    let home = slot / Z_CHUNK;
 
     if scan_chunk(arena, home, &q) {
         return false;
@@ -988,7 +1010,11 @@ fn scan_chunk(arena: &Arena, c: usize, q: &EarQuery) -> bool {
         {
             continue;
         }
-        if arena.area(arena.get(p).prev, p, arena.get(p).next) >= 0.0 {
+        let (p_prev, p_next) = {
+            let n = arena.get(p);
+            (n.prev, n.next)
+        };
+        if arena.area_at(p_prev, px, py, p_next) >= 0.0 {
             return true;
         }
     }
@@ -1163,8 +1189,7 @@ fn eliminate_hole(arena: &mut Arena, hole: u32, outer_node: u32) -> u32 {
 /// possibly beat the current best crossing.
 fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32> {
     let p = outer_node;
-    let hx = arena.get(hole).x;
-    let hy = arena.get(hole).y;
+    let (hx, hy) = arena.xy(hole);
     let mut qx = f64::NEG_INFINITY;
     let mut m: Option<u32> = None;
 
@@ -1191,25 +1216,24 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
             continue;
         }
 
-        // ensure the walk's exclusive bound is live so we don't overrun into other blocks
         for i in arena.block_range(b) {
             let p = arena.block_nodes[i];
-            if arena.is_live(p) {
-                // skip nodes removed by filter_points (stale in the index)
-                let p_next = arena.get(p).next;
-                if arena.equals(hole, p_next) {
+            let (px, py, p_prev, p_next) = {
+                let n = arena.get(p);
+                (n.x, n.y, n.prev, n.next)
+            };
+            // skip nodes removed by filter_points (stale in the index)
+            if arena.is_live(p, p_prev) {
+                let (nx_, ny_) = arena.xy(p_next);
+                if hx == nx_ && hy == ny_ {
                     return Some(p_next);
-                } else {
-                    let (px, py) = (arena.get(p).x, arena.get(p).y);
-                    let (nx_, ny_) = (arena.get(p_next).x, arena.get(p_next).y);
-                    if hy <= py && hy >= ny_ && ny_ != py {
-                        let x = px + (hy - py) * (nx_ - px) / (ny_ - py);
-                        if x <= hx && x > qx {
-                            qx = x;
-                            m = Some(if px < nx_ { p } else { p_next });
-                            if x == hx {
-                                return m; // hole touches outer segment; pick leftmost endpoint
-                            }
+                } else if hy <= py && hy >= ny_ && ny_ != py {
+                    let x = px + (hy - py) * (nx_ - px) / (ny_ - py);
+                    if x <= hx && x > qx {
+                        qx = x;
+                        m = Some(if px < nx_ { p } else { p_next });
+                        if x == hx {
+                            return m; // hole touches outer segment; pick leftmost endpoint
                         }
                     }
                 }
@@ -1224,8 +1248,7 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
     // look for points inside the triangle of hole vertex, segment intersection and endpoint;
     // if there are no points found, we have a valid connection; otherwise choose the vertex
     // of the minimum angle with the ray as connection vertex
-    let mx = arena.get(m0).x;
-    let my = arena.get(m0).y;
+    let (mx, my) = arena.xy(m0);
     let t_min_y = hy.min(my); // the triangle's y span; x span is [mx, hx]
     let t_max_y = hy.max(my);
     let mut tan_min = f64::INFINITY;
@@ -1250,8 +1273,11 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
 
         for i in arena.block_range(b) {
             let p = arena.block_nodes[i];
-            let (px, py) = (arena.get(p).x, arena.get(p).y);
-            if arena.is_live(p) // skip nodes removed by filter_points
+            let (px, py, p_prev, p_next) = {
+                let n = arena.get(p);
+                (n.x, n.y, n.prev, n.next)
+            };
+            if arena.is_live(p, p_prev) // skip nodes removed by filter_points
                 && hx >= px
                 && px >= mx
                 && hx != px
@@ -1270,14 +1296,13 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
 
                 // if hole point sits on p's horizontal edge (T-junction touch): the bridge
                 // runs along that edge — locally_inside rejects it as collinear, but it's valid
-                if (locally_inside(arena, p, hole)
-                    || (py == hy
-                        && arena.get(arena.get(p).next).y == hy
-                        && arena.get(arena.get(p).next).x > hx))
-                    && (tan < tan_min
-                        || (tan == tan_min
-                            && (px > arena.get(m).x
-                                || (px == arena.get(m).x && sector_contains_sector(arena, m, p)))))
+                let mx_ = arena.get(m).x;
+                if (locally_inside(arena, p, hole) || {
+                    let n = arena.get(p_next);
+                    py == hy && n.y == hy && n.x > hx
+                }) && (tan < tan_min
+                    || (tan == tan_min
+                        && (px > mx_ || (px == mx_ && sector_contains_sector(arena, m, p)))))
                 {
                     m = p;
                     tan_min = tan;
@@ -1429,6 +1454,12 @@ fn get_leftmost(arena: &Arena, start: u32) -> u32 {
     leftmost
 }
 
+/// signed area of the triangle `(p, q, r)`, from raw coordinates
+#[inline]
+fn area_xy(px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64) -> f64 {
+    (qy - py) * (rx - qx) - (qx - px) * (ry - qy)
+}
+
 /// check if a point lies within a convex triangle
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -1465,10 +1496,15 @@ fn is_valid_diagonal(arena: &Arena, a: u32, b: u32) -> bool {
 
 /// check if two segments intersect; by default includes collinear boundary touches
 fn intersects(arena: &Arena, p1: u32, q1: u32, p2: u32, q2: u32, include_boundary: bool) -> bool {
-    let o1 = arena.area(p1, q1, p2);
-    let o2 = arena.area(p1, q1, q2);
-    let o3 = arena.area(p2, q2, p1);
-    let o4 = arena.area(p2, q2, q1);
+    let (p1x, p1y) = arena.xy(p1);
+    let (q1x, q1y) = arena.xy(q1);
+    let (p2x, p2y) = arena.xy(p2);
+    let (q2x, q2y) = arena.xy(q2);
+
+    let o1 = area_xy(p1x, p1y, q1x, q1y, p2x, p2y);
+    let o2 = area_xy(p1x, p1y, q1x, q1y, q2x, q2y);
+    let o3 = area_xy(p2x, p2y, q2x, q2y, p1x, p1y);
+    let o4 = area_xy(p2x, p2y, q2x, q2y, q1x, q1y);
 
     if ((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0))
         && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))
@@ -1476,30 +1512,17 @@ fn intersects(arena: &Arena, p1: u32, q1: u32, p2: u32, q2: u32, include_boundar
         return true;
     }
 
-    if !include_boundary {
-        return false;
-    }
-
-    if o1 == 0.0 && on_segment(arena, p1, p2, q1) {
-        return true;
-    }
-    if o2 == 0.0 && on_segment(arena, p1, q2, q1) {
-        return true;
-    }
-    if o3 == 0.0 && on_segment(arena, p2, p1, q2) {
-        return true;
-    }
-    if o4 == 0.0 && on_segment(arena, p2, q1, q2) {
-        return true;
-    }
-
-    false
+    include_boundary
+        && ((o1 == 0.0 && on_segment(p1x, p1y, p2x, p2y, q1x, q1y))
+            || (o2 == 0.0 && on_segment(p1x, p1y, q2x, q2y, q1x, q1y))
+            || (o3 == 0.0 && on_segment(p2x, p2y, p1x, p1y, q2x, q2y))
+            || (o4 == 0.0 && on_segment(p2x, p2y, q1x, q1y, q2x, q2y)))
 }
 
 /// for collinear points p, q, r, check if point q lies on segment pr
-fn on_segment(arena: &Arena, p: u32, q: u32, r: u32) -> bool {
-    let (p, q, r) = (arena.get(p), arena.get(q), arena.get(r));
-    q.x <= p.x.max(r.x) && q.x >= p.x.min(r.x) && q.y <= p.y.max(r.y) && q.y >= p.y.min(r.y)
+#[inline]
+fn on_segment(px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64) -> bool {
+    qx <= px.max(rx) && qx >= px.min(rx) && qy <= py.max(ry) && qy >= py.min(ry)
 }
 
 /// check if a polygon diagonal intersects any polygon segments
@@ -1510,34 +1533,37 @@ fn intersects_polygon(arena: &Arena, a: u32, b: u32) -> bool {
     let min_y = an.y.min(bn.y);
     let max_y = an.y.max(bn.y);
 
-    let a_i = arena.get(a).i();
-    let b_i = arena.get(b).i();
+    let a_i = an.i();
+    let b_i = bn.i();
 
     let mut p = a;
+    let (mut px, mut py, mut p_i) = {
+        let n = arena.get(p);
+        (n.x, n.y, n.i())
+    };
     loop {
         let n = arena.get(p).next;
-        let (px, py) = (arena.get(p).x, arena.get(p).y);
-        let (nx, ny) = (arena.get(n).x, arena.get(n).y);
+        let (nx, ny, n_i) = {
+            let v = arena.get(n);
+            (v.x, v.y, v.i())
+        };
         if !((px > max_x && nx > max_x)
             || (px < min_x && nx < min_x)
             || (py > max_y && ny > max_y)
             || (py < min_y && ny < min_y))
+            && p_i != a_i
+            && n_i != a_i
+            && p_i != b_i
+            && n_i != b_i
+            && intersects(arena, p, n, a, b, true)
         {
-            let p_i = arena.get(p).i();
-            let n_i = arena.get(n).i();
-            if p_i != a_i
-                && n_i != a_i
-                && p_i != b_i
-                && n_i != b_i
-                && intersects(arena, p, n, a, b, true)
-            {
-                return true;
-            }
+            return true;
         }
         p = n;
         if p == a {
             break;
         }
+        (px, py, p_i) = (nx, ny, n_i);
     }
 
     false
@@ -1545,12 +1571,18 @@ fn intersects_polygon(arena: &Arena, a: u32, b: u32) -> bool {
 
 /// check if a polygon diagonal is locally inside the polygon
 fn locally_inside(arena: &Arena, a: u32, b: u32) -> bool {
-    let a_prev = arena.get(a).prev;
-    let a_next = arena.get(a).next;
-    if arena.area(a_prev, a, a_next) < 0.0 {
-        arena.area(a, b, a_next) >= 0.0 && arena.area(a, a_prev, b) >= 0.0
+    let (a_prev, a_next) = {
+        let n = arena.get(a);
+        (n.prev, n.next)
+    };
+    let (ax, ay) = arena.xy(a);
+    let (vx, vy) = arena.xy(a_prev);
+    let (wx, wy) = arena.xy(a_next);
+    let (bx, by) = arena.xy(b);
+    if area_xy(vx, vy, ax, ay, wx, wy) < 0.0 {
+        area_xy(ax, ay, bx, by, wx, wy) >= 0.0 && area_xy(ax, ay, vx, vy, bx, by) >= 0.0
     } else {
-        arena.area(a, b, a_prev) < 0.0 || arena.area(a, a_next, b) < 0.0
+        area_xy(ax, ay, bx, by, vx, vy) < 0.0 || area_xy(ax, ay, wx, wy, bx, by) < 0.0
     }
 }
 
@@ -1561,18 +1593,19 @@ fn middle_inside(arena: &Arena, a: u32, b: u32) -> bool {
     let py = (an.y + bn.y) / 2.0;
 
     let mut p = a;
+    let (mut qx, mut qy) = arena.xy(p);
     let mut inside = false;
     loop {
         let n = arena.get(p).next;
-        let pn = arena.get(p);
-        let nn = arena.get(n);
-        if (pn.y > py) != (nn.y > py) && px < (nn.x - pn.x) * (py - pn.y) / (nn.y - pn.y) + pn.x {
+        let (nx, ny) = arena.xy(n);
+        if (qy > py) != (ny > py) && px < (nx - qx) * (py - qy) / (ny - qy) + qx {
             inside = !inside;
         }
         p = n;
         if p == a {
             break;
         }
+        (qx, qy) = (nx, ny);
     }
 
     inside

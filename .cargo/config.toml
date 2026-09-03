@@ -1,0 +1,7 @@
+# Build for the host CPU. `rearcut`'s hot loops are f64 comparison filters over the z-order
+# index, which the x86-64 baseline (SSE2, 2 f64 lanes) leaves largely scalar; AVX widens them
+# to 4 lanes. This applies to local builds and benchmarks only — it is not inherited by
+# downstream crates depending on a published `rearcut`, so it never produces a non-portable
+# library for someone else.
+[build]
+rustflags = ["-C", "target-cpu=native"]

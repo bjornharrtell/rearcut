@@ -10,6 +10,9 @@ fn main() {
             .file("cpp/earcut_ffi.cpp")
             .include("cpp")
             .opt_level(3)
+            // match the `-C target-cpu=native` in .cargo/config.toml, so the benchmark
+            // compares like with like
+            .flag_if_supported("-march=native")
             .compile("earcut_hpp_ffi");
     }
 }

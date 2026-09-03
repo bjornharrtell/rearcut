@@ -110,43 +110,55 @@ their reusable `Earcut` struct so repeated calls don't pay for a fresh
 arena each time; `lyon` and `earcut.hpp` have no such API and are measured
 one-shot.)
 
-| Benchmark | rearcut | earcut-rs | lyon | earcut.hpp |
+| Benchmark | rearcut | earcut-rs | earcut.hpp | lyon |
 |---|---:|---:|---:|---:|
-| `fixtures/building` | 0.18 µs | 0.17 µs | 1.4 µs | 0.26 µs |
-| `fixtures/dude` | 6.3 µs | 4.4 µs | 8.5 µs | 4.1 µs |
-| `fixtures/bad-hole` | 1.8 µs | 2.1 µs | 4.4 µs | 2.1 µs |
-| `fixtures/water` | 177 µs | 186 µs | 523 µs | 249 µs |
-| `fixtures/water2` | 200 µs | 148 µs | 120 µs | 163 µs |
-| `fixtures/water-huge` | 1.41 ms | 1.34 ms | 1.19 ms | 1.41 ms |
-| `fixtures/water-huge3` | 14.0 ms | 18.6 ms | 4.9 ms | 22.0 ms |
-| `star/16` | 0.53 µs | 0.57 µs | 3.6 µs | 0.69 µs |
-| `star/4096` | 8.35 ms | 13.1 ms | 39.2 ms | 14.6 ms |
-| `star/65536` | 2.08 s | 4.14 s | 10.0 s | 4.37 s |
-| `holes/64` | 26 µs | 44 µs | 25 µs | 42 µs |
-| `holes/1024` | 1.81 ms | 7.42 ms | 0.63 ms | 7.04 ms |
+| `fixtures/building` | 145 ns | 154 ns | 247 ns | 1.40 µs |
+| `fixtures/dude` | 6.18 µs | 3.99 µs | 4.02 µs | 8.72 µs |
+| `fixtures/bad-hole` | 1.77 µs | 1.98 µs | 2.08 µs | 4.34 µs |
+| `fixtures/water3b` | 853 ns | 866 ns | 1.01 µs | 2.60 µs |
+| `fixtures/water4` | 57.9 µs | 49.1 µs | 47.0 µs | 66.1 µs |
+| `fixtures/water2` | 208 µs | 135 µs | 157 µs | 118 µs |
+| `fixtures/water` | 178 µs | 168 µs | 203 µs | 511 µs |
+| `fixtures/water-huge` | 1.43 ms | 1.25 ms | 1.38 ms | 1.17 ms |
+| `fixtures/water-huge3` | 13.8 ms | 18.0 ms | 21.5 ms | 4.60 ms |
+| `star/16` | 518 ns | 540 ns | 569 ns | 3.43 µs |
+| `star/256` | 47.9 µs | 51.4 µs | 45.2 µs | 176 µs |
+| `star/4096` | 7.67 ms | 11.65 ms | 13.60 ms | 29.33 ms |
+| `star/65536` | 1.88 s | 3.19 s | 4.03 s | 7.30 s |
+| `holes/4` | 644 ns | 760 ns | 884 ns | 1.99 µs |
+| `holes/64` | 26.1 µs | 43.3 µs | 40.8 µs | 24.7 µs |
+| `holes/256` | 181 µs | 567 µs | 559 µs | 112 µs |
+| `holes/1024` | 1.83 ms | 7.70 ms | 7.62 ms | 593 µs |
 
 **Takeaway:** `rearcut` is the fastest of the three ear-clipping
-implementations on almost every input, and the margin grows with size:
-roughly 2x faster than both `earcut-rs` and `earcut.hpp` on the large
-concave `star` cases and on the many-hole `holes` grid, and ~1.5x faster
-on `water-huge3`. Two structural changes account for most of that: the
-hole-bridge index gives each block an explicit node list rather than a
-ring range (so a block's scan cost stays bounded by its own size even
-after `split_polygon` splices a hole into the middle of it), and the
-z-order index is a sorted array walked outwards from the ear's own slot,
-rather than a doubly linked z-list chased through the arena.
+implementations on most inputs, and its margin grows with size: ~1.7x
+faster than `earcut-rs` and ~2.1x faster than `earcut.hpp` on
+`star/65536`, and ~4x faster than both on the many-hole `holes/1024`
+grid. Two structural changes account for most of that. The hole-bridge
+index gives each block an explicit node list rather than a ring range, so
+a block's scan cost stays bounded by its own size even after
+`split_polygon` splices a hole into the middle of it. And the z-order
+index is a sorted array walked outwards from the ear's own slot, rather
+than a doubly linked z-list chased through the arena — it rejects a whole
+aligned block of candidates with one branchless filter, and its entries
+are sequential in memory instead of a pointer chase.
+
+That array scan pays a small fixed cost per query which only amortises
+once scans are long, so on the mid-size fixtures whose scans are short
+(`fixtures/dude`, `fixtures/water2`) it is 20–50% slower than the linked
+z-list it replaced. That is the trade made for the much larger wins
+above.
 
 Against lyon's sweep-line tessellator, ear clipping wins by 2–5x on
 concave, hole-free polygons (`star`) and on fixtures with a few large
 holes, but loses on inputs with very many small holes (`holes/1024`,
 `water-huge3`) — a sweep line is simply the better asymptotic fit there.
 
-The array-based z-order scan tests a fixed-size block of entries at a
-time, so it pays a small fixed cost per query that only amortises once
-scans are long. On the mid-size fixtures whose scans are short
-(`fixtures/dude`, `fixtures/water2`) that costs 20–50% versus the linked
-z-list it replaced, which is the trade made for the much larger wins
-above.
+Note that `.cargo/config.toml` builds with `-C target-cpu=native` (and
+`build.rs` passes `-march=native` to `earcut.hpp`), so these numbers are
+for host-tuned builds of every implementation. It is worth 3–5% on the
+`star` cases. It applies to builds run from inside this repository only,
+and is not inherited by crates that depend on a published `rearcut`.
 
 ## Acknowledgements
 
