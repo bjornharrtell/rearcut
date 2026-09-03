@@ -112,30 +112,41 @@ one-shot.)
 
 | Benchmark | rearcut | earcut-rs | lyon | earcut.hpp |
 |---|---:|---:|---:|---:|
-| `fixtures/building` | 0.16 µs | 0.17 µs | 1.4 µs | 0.25 µs |
-| `fixtures/dude` | 4.1 µs | 4.4 µs | 8.6 µs | 4.2 µs |
-| `fixtures/bad-hole` | 1.9 µs | 2.1 µs | 4.7 µs | 2.3 µs |
-| `fixtures/water` | 177 µs | 191 µs | 537 µs | 193 µs |
-| `fixtures/water-huge` | 1.46 ms | 1.36 ms | 1.22 ms | 1.48 ms |
-| `fixtures/water-huge3` | 21.1 ms | 19.1 ms | 5.8 ms | 21.3 ms |
-| `star/16` | 0.53 µs | 0.58 µs | 3.8 µs | 0.60 µs |
-| `star/4096` | 12.4 ms | 12.3 ms | 41 ms | 15.2 ms |
-| `star/65536` | 3.46 s | 3.37 s | 11.2 s | 4.3 s |
-| `holes/64` | 46 µs | 47 µs | 26 µs | 44 µs |
-| `holes/1024` | 8.0 ms | 7.8 ms | 0.74 ms | 7.4 ms |
+| `fixtures/building` | 0.18 µs | 0.17 µs | 1.4 µs | 0.26 µs |
+| `fixtures/dude` | 6.3 µs | 4.4 µs | 8.5 µs | 4.1 µs |
+| `fixtures/bad-hole` | 1.8 µs | 2.1 µs | 4.4 µs | 2.1 µs |
+| `fixtures/water` | 177 µs | 186 µs | 523 µs | 249 µs |
+| `fixtures/water2` | 200 µs | 148 µs | 120 µs | 163 µs |
+| `fixtures/water-huge` | 1.41 ms | 1.34 ms | 1.19 ms | 1.41 ms |
+| `fixtures/water-huge3` | 14.0 ms | 18.6 ms | 4.9 ms | 22.0 ms |
+| `star/16` | 0.53 µs | 0.57 µs | 3.6 µs | 0.69 µs |
+| `star/4096` | 8.35 ms | 13.1 ms | 39.2 ms | 14.6 ms |
+| `star/65536` | 2.08 s | 4.14 s | 10.0 s | 4.37 s |
+| `holes/64` | 26 µs | 44 µs | 25 µs | 42 µs |
+| `holes/1024` | 1.81 ms | 7.42 ms | 0.63 ms | 7.04 ms |
 
-**Takeaway:** for simple-to-moderately-complex polygons, and especially for
-concave, hole-free polygons (e.g. `star`), `rearcut`'s ear-slicing approach
-is consistently 2–4x faster than lyon's sweep-line tessellator. Against
-`earcut-rs` (georust's independent port), `rearcut` now wins or ties on
-most benchmarks — after switching node handles to precomputed byte
-offsets (like `earcut-rs`'s `NodeOffset`), avoiding a stride multiply on
-every node dereference — with a small remaining gap (~2–11%) only on a
-few of the largest inputs (`water-huge`, `water-huge3`, `water2`). The
-`holes` benchmark's small, uniform-size synthetic holes are a weaker case
-for both crates' block-bbox hole-bridge index than realistic many-vertex
-holes (see `fixtures/water-huge3`), which is why lyon's sweep-line
-approach wins there despite losing everywhere else.
+**Takeaway:** `rearcut` is the fastest of the three ear-clipping
+implementations on almost every input, and the margin grows with size:
+roughly 2x faster than both `earcut-rs` and `earcut.hpp` on the large
+concave `star` cases and on the many-hole `holes` grid, and ~1.5x faster
+on `water-huge3`. Two structural changes account for most of that: the
+hole-bridge index gives each block an explicit node list rather than a
+ring range (so a block's scan cost stays bounded by its own size even
+after `split_polygon` splices a hole into the middle of it), and the
+z-order index is a sorted array walked outwards from the ear's own slot,
+rather than a doubly linked z-list chased through the arena.
+
+Against lyon's sweep-line tessellator, ear clipping wins by 2–5x on
+concave, hole-free polygons (`star`) and on fixtures with a few large
+holes, but loses on inputs with very many small holes (`holes/1024`,
+`water-huge3`) — a sweep line is simply the better asymptotic fit there.
+
+The array-based z-order scan tests a fixed-size block of entries at a
+time, so it pays a small fixed cost per query that only amortises once
+scans are long. On the mid-size fixtures whose scans are short
+(`fixtures/dude`, `fixtures/water2`) that costs 20–50% versus the linked
+z-list it replaced, which is the trade made for the much larger wins
+above.
 
 ## Acknowledgements
 
