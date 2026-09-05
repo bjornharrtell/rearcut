@@ -125,6 +125,7 @@ impl Node {
 
 /// edges per block in the hole-bridge block-bbox index (see `Arena::build_block_index`)
 const BLOCK_SIZE: i32 = 16;
+const BLOCK_INDEX_MIN_NODES: usize = 256;
 
 /// Arena of nodes backing the doubly linked list(s) used by the algorithm.
 struct Arena {
@@ -660,9 +661,9 @@ fn earcut_linked<N: EarcutIndex>(
 
     // iterate through ears, slicing them one by one
     loop {
-        let (prev, next, ex, ey) = {
+        let (prev, next, prev_z, next_z, ex, ey) = {
             let n = arena.get(ear);
-            (n.prev, n.next, n.x, n.y)
+            (n.prev, n.next, n.prev_z, n.next_z, n.x, n.y)
         };
         if prev == next {
             break;
@@ -670,7 +671,9 @@ fn earcut_linked<N: EarcutIndex>(
 
         if arena.area_at(prev, ex, ey, next) < 0.0
             && (if inv_size != 0.0 {
-                is_ear_hashed(arena, ear, min_x, min_y, inv_size)
+                is_ear_hashed(
+                    arena, prev, next, prev_z, next_z, ex, ey, min_x, min_y, inv_size,
+                )
             } else {
                 is_ear(arena, ear)
             })
@@ -753,13 +756,20 @@ fn is_ear(arena: &Arena, ear: u32) -> bool {
     true
 }
 
-fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64) -> bool {
-    let a = arena.get(ear).prev;
-    let b = ear;
-    let c = arena.get(ear).next;
-
+#[allow(clippy::too_many_arguments)]
+fn is_ear_hashed(
+    arena: &Arena,
+    a: u32,
+    c: u32,
+    prev_z: u32,
+    next_z: u32,
+    bx: f64,
+    by: f64,
+    min_x: f64,
+    min_y: f64,
+    inv_size: f64,
+) -> bool {
     let (ax, ay) = (arena.get(a).x, arena.get(a).y);
-    let (bx, by) = (arena.get(b).x, arena.get(b).y);
     let (cx, cy) = (arena.get(c).x, arena.get(c).y);
 
     let x0 = ax.min(bx).min(cx);
@@ -770,9 +780,12 @@ fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64)
     let min_z = z_order(x0, y0, min_x, min_y, inv_size);
     let max_z = z_order(x1, y1, min_x, min_y, inv_size);
 
-    let mut p = arena.get(ear).prev_z;
-    while p != NULL && arena.get(p).z >= min_z {
+    let mut p = prev_z;
+    while p != NULL {
         let pn = arena.get(p);
+        if pn.z < min_z {
+            break;
+        }
         let (px, py) = (pn.x, pn.y);
         if p != c
             && px >= x0
@@ -781,16 +794,19 @@ fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64)
             && py <= y1
             && !(ax == px && ay == py)
             && point_in_triangle(ax, ay, bx, by, cx, cy, px, py)
-            && arena.area(arena.get(p).prev, p, arena.get(p).next) >= 0.0
+            && arena.area_at(pn.prev, px, py, pn.next) >= 0.0
         {
             return false;
         }
-        p = arena.get(p).prev_z;
+        p = pn.prev_z;
     }
 
-    let mut n = arena.get(ear).next_z;
-    while n != NULL && arena.get(n).z <= max_z {
+    let mut n = next_z;
+    while n != NULL {
         let nn = arena.get(n);
+        if nn.z > max_z {
+            break;
+        }
         let (nx, ny) = (nn.x, nn.y);
         if n != c
             && nx >= x0
@@ -799,11 +815,11 @@ fn is_ear_hashed(arena: &Arena, ear: u32, min_x: f64, min_y: f64, inv_size: f64)
             && ny <= y1
             && !(ax == nx && ay == ny)
             && point_in_triangle(ax, ay, bx, by, cx, cy, nx, ny)
-            && arena.area(arena.get(n).prev, n, arena.get(n).next) >= 0.0
+            && arena.area_at(nn.prev, nx, ny, nn.next) >= 0.0
         {
             return false;
         }
-        n = arena.get(n).next_z;
+        n = nn.next_z;
     }
 
     true
@@ -913,14 +929,17 @@ fn eliminate_holes(
 
     queue.sort_unstable_by(|&a, &b| compare_xy_slope(arena, a, b));
 
-    // block-bbox index for find_hole_bridge, grown append-only as holes merge. Seed it with
-    // the outer ring, then append each merged hole.
-    arena.build_block_index(data.len() / dim, queue.len());
-    arena.index_segment(outer_node, outer_node);
+    // The block index amortizes its setup cost on larger rings. Small polygons are faster with
+    // the original linear bridge scan because they do not have enough edges for bbox pruning to
+    // pay for building and checking the index.
+    let use_block_index = data.len() / dim >= BLOCK_INDEX_MIN_NODES;
+    if use_block_index {
+        arena.build_block_index(data.len() / dim, queue.len());
+        arena.index_segment(outer_node, outer_node);
+        arena.index_active = true;
+    }
 
-    // process holes from left to right; index_active lets remove_node keep block bboxes live
-    // as filter_points heals edges during merges (see grow_block)
-    arena.index_active = true;
+    // process holes from left to right
     for hole in queue {
         outer_node = eliminate_hole(arena, hole, outer_node);
     }
@@ -957,13 +976,15 @@ fn eliminate_hole(arena: &mut Arena, hole: u32, outer_node: u32) -> u32 {
 
     let bridge_reverse = split_polygon(arena, bridge, hole);
 
-    // index the merged-in segment before filtering: in ring order the splice runs
-    // bridge -> hole -> bridge_reverse -> bridge2 -> (bridge's old next), covering the
-    // hole's edges and both new slit edges. filter_points below only drops
-    // collinear/coincident points, so these bboxes stay valid (conservative) supersets.
-    let bridge2 = arena.get(bridge_reverse).next;
-    let bridge2_next = arena.get(bridge2).next;
-    arena.index_segment(bridge, bridge2_next);
+    if arena.index_active {
+        // index the merged-in segment before filtering: in ring order the splice runs
+        // bridge -> hole -> bridge_reverse -> bridge2 -> (bridge's old next), covering the
+        // hole's edges and both new slit edges. filter_points below only drops
+        // collinear/coincident points, so these bboxes stay valid (conservative) supersets.
+        let bridge2 = arena.get(bridge_reverse).next;
+        let bridge2_next = arena.get(bridge2).next;
+        arena.index_segment(bridge, bridge2_next);
+    }
 
     // heal collinear/coincident points around the two new slit edges
     let bridge_reverse_next = arena.get(bridge_reverse).next;
@@ -976,6 +997,10 @@ fn eliminate_hole(arena: &mut Arena, hole: u32, outer_node: u32) -> u32 {
 /// block-bbox index built by `eliminate_holes` to skip whole runs of ring edges that can't
 /// possibly beat the current best crossing.
 fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32> {
+    if arena.num_blocks == 0 {
+        return find_hole_bridge_linear(arena, hole, outer_node);
+    }
+
     let p = outer_node;
     let (hx, hy) = arena.xy(hole);
     let mut qx = f64::NEG_INFINITY;
@@ -1099,6 +1124,90 @@ fn find_hole_bridge(arena: &mut Arena, hole: u32, outer_node: u32) -> Option<u32
         }
         b += 1;
         g += 4;
+    }
+
+    Some(m)
+}
+
+/// Linear bridge search for small polygons, where building and scanning the block index costs
+/// more than the bbox checks can save.
+fn find_hole_bridge_linear(arena: &Arena, hole: u32, outer_node: u32) -> Option<u32> {
+    let (hx, hy) = arena.xy(hole);
+    let mut qx = f64::NEG_INFINITY;
+    let mut m: Option<u32> = None;
+
+    if arena.equals(hole, outer_node) {
+        return Some(outer_node);
+    }
+
+    let mut p = outer_node;
+    loop {
+        let node = arena.get(p);
+        let p_next = node.next;
+        let (px, py) = (node.x, node.y);
+        let next = arena.get(p_next);
+        let (nx, ny) = (next.x, next.y);
+        if hx == nx && hy == ny {
+            return Some(p_next);
+        }
+        if hy <= py && hy >= ny && ny != py {
+            let x = px + (hy - py) * (nx - px) / (ny - py);
+            if x <= hx && x > qx {
+                qx = x;
+                m = Some(if px < nx { p } else { p_next });
+                if x == hx {
+                    return m;
+                }
+            }
+        }
+        p = p_next;
+        if p == outer_node {
+            break;
+        }
+    }
+
+    let m0 = m?;
+    let (mx, my) = arena.xy(m0);
+    let mut tan_min = f64::INFINITY;
+    let mut m = m0;
+
+    let mut p = outer_node;
+    loop {
+        let node = arena.get(p);
+        let p_next = node.next;
+        let (px, py) = (node.x, node.y);
+        if hx >= px
+            && px >= mx
+            && hx != px
+            && point_in_triangle(
+                if hy < my { hx } else { qx },
+                hy,
+                mx,
+                my,
+                if hy < my { qx } else { hx },
+                hy,
+                px,
+                py,
+            )
+        {
+            let tan = (hy - py).abs() / (hx - px);
+            let next = arena.get(p_next);
+            let current_mx = arena.get(m).x;
+            if (locally_inside(arena, p, hole)
+                || (py == hy && next.y == hy && next.x > hx))
+                && (tan < tan_min
+                    || (tan == tan_min
+                        && (px > current_mx
+                            || (px == current_mx && sector_contains_sector(arena, m, p)))))
+            {
+                m = p;
+                tan_min = tan;
+            }
+        }
+        p = p_next;
+        if p == outer_node {
+            break;
+        }
     }
 
     Some(m)
