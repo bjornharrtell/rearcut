@@ -253,7 +253,7 @@ fn bench_fixtures(c: &mut Criterion) {
 
 fn bench_stars(c: &mut Criterion) {
     let mut group = c.benchmark_group("star");
-    for &points in &[16usize, 256, 4096, 65536] {
+    for &points in &[16usize, 256, 4096] {
         let rings = star(points, 100.0, 40.0);
         group.throughput(Throughput::Elements(points as u64 * 2));
 

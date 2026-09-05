@@ -1193,8 +1193,7 @@ fn find_hole_bridge_linear(arena: &Arena, hole: u32, outer_node: u32) -> Option<
             let tan = (hy - py).abs() / (hx - px);
             let next = arena.get(p_next);
             let current_mx = arena.get(m).x;
-            if (locally_inside(arena, p, hole)
-                || (py == hy && next.y == hy && next.x > hx))
+            if (locally_inside(arena, p, hole) || (py == hy && next.y == hy && next.x > hx))
                 && (tan < tan_min
                     || (tan == tan_min
                         && (px > current_mx
