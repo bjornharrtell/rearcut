@@ -112,28 +112,26 @@ one-shot.)
 
 | Benchmark | rearcut | earcut-rs | earcut.hpp | lyon |
 |---|---:|---:|---:|---:|
-| `fixtures/building` | 141 ns | 151 ns | 250 ns | 1.37 µs |
-| `fixtures/dude` | 4.07 µs | 4.00 µs | 3.99 µs | 8.39 µs |
-| `fixtures/bad-hole` | 1.77 µs | 1.90 µs | 2.05 µs | 4.27 µs |
-| `fixtures/water3b` | 858 ns | 869 ns | 1.02 µs | 2.52 µs |
-| `fixtures/water4` | 45.5 µs | 47.4 µs | 47.1 µs | 64.2 µs |
-| `fixtures/water2` | 155 µs | 135 µs | 158 µs | 115 µs |
-| `fixtures/water` | 167 µs | 171 µs | 195 µs | 513 µs |
-| `fixtures/water-huge` | 1.34 ms | 1.33 ms | 1.45 ms | 1.21 ms |
-| `fixtures/water-huge3` | 19.1 ms | 18.6 ms | 21.0 ms | 4.85 ms |
-| `star/16` | 555 ns | 536 ns | 572 ns | 3.45 µs |
-| `star/256` | 47.9 µs | 51.6 µs | 47.1 µs | 180 µs |
-| `star/4096` | 11.8 ms | 12.2 ms | 14.4 ms | 32.8 ms |
-| `star/65536` | 3.55 s | 3.73 s | 4.68 s | 8.16 s |
-| `holes/4` | 669 ns | 731 ns | 905 ns | 2.05 µs |
-| `holes/64` | 22.9 µs | 45.3 µs | 43.0 µs | 25.5 µs |
-| `holes/256` | 189 µs | 618 µs | 632 µs | 115 µs |
-| `holes/1024` | 2.18 ms | 8.31 ms | 7.83 ms | 609 µs |
+| `fixtures/building` | 137 ns | 151 ns | 241 ns | 1.38 µs |
+| `fixtures/dude` | 4.05 µs | 4.17 µs | 3.88 µs | 8.18 µs |
+| `fixtures/bad-hole` | 1.54 µs | 1.92 µs | 2.08 µs | 4.21 µs |
+| `fixtures/water3b` | 702 ns | 886 ns | 1.07 µs | 2.56 µs |
+| `fixtures/water4` | 45.2 µs | 50.0 µs | 46.6 µs | 66.3 µs |
+| `fixtures/water2` | 150 µs | 137 µs | 157 µs | 117 µs |
+| `fixtures/water` | 168 µs | 167 µs | 208 µs | 522 µs |
+| `fixtures/water-huge` | 1.32 ms | 1.27 ms | 1.39 ms | 1.18 ms |
+| `fixtures/water-huge3` | 18.3 ms | 18.0 ms | 21.3 ms | 4.78 ms |
+| `star/16` | 523 ns | 528 ns | 576 ns | 3.42 µs |
+| `star/256` | 46.6 µs | 51.6 µs | 46.6 µs | 182 µs |
+| `star/4096` | 11.8 ms | 12.1 ms | 14.3 ms | 33.3 ms |
+| `holes/4` | 543 ns | 724 ns | 910 ns | 2.02 µs |
+| `holes/64` | 22.5 µs | 44.3 µs | 42.2 µs | 24.8 µs |
+| `holes/256` | 179 µs | 617 µs | 616 µs | 117 µs |
+| `holes/1024` | 2.08 ms | 8.12 ms | 7.48 ms | 605 µs |
 
 **Takeaway:** `rearcut` is at or near parity with `earcut-rs` and
 `earcut.hpp` on typical inputs, and pulls ahead as size or hole count
-grows: ~5% faster than `earcut-rs` on `star/65536`, and ~4x faster than
-both on the many-hole `holes/1024` grid. The main structural change
+grows: ~4x faster than both on the many-hole `holes/1024` grid. The main structural change
 behind that is the hole-bridge index: each block gets an explicit node
 list rather than a ring range, so a block's scan cost stays bounded by
 its own size even after `split_polygon` splices a hole into the middle
