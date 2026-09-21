@@ -136,7 +136,12 @@ behind that is the hole-bridge index: each block gets an explicit node
 list rather than a ring range, so a block's scan cost stays bounded by
 its own size even after `split_polygon` splices a hole into the middle
 of it — this is a strict win with no trade-off, since it never scans
-more per block than it did before.
+more per block than it did before. A second, size-gated change targets the
+same kind of large, many-hole input: once a merged ring is large enough
+(`Z_ARRAY_MIN_NODES`), ear clipping's z-order neighbour index switches from a
+linked list threaded through scattered `Node`s to a contiguous, amortized-compacting
+array, which is far cheaper to scan; below that size the extra bookkeeping
+isn't worth it, so small/typical fixtures keep the original linked-list index.
 
 Against lyon's sweep-line tessellator, ear clipping wins by 2–5x on
 concave, hole-free polygons (`star`) and on fixtures with a few large
