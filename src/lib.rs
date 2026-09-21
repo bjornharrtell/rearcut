@@ -127,6 +127,17 @@ impl Node {
 const BLOCK_SIZE: i32 = 16;
 const BLOCK_INDEX_MIN_NODES: usize = 256;
 
+/// Below this ring size, `index_curve` threads z-order neighbours directly through
+/// `Node::prev_z`/`next_z` (mirrors upstream earcut.js/earcut.hpp). At or above it, it instead
+/// builds a contiguous `Arena::z_entries` array (see `is_ear_hashed_array`): walking that array
+/// touches only tightly packed `(z, node, x, y)` records instead of chasing pointers through
+/// arbitrary `Node`s scattered across `Arena::nodes` in ring-insertion (not z) order, which pays
+/// off once a ring is large enough that the pointer chase routinely misses cache. Below the
+/// threshold the extra bookkeeping (position table, tombstone array) costs more than it saves —
+/// experimentally this regressed real-world fixtures like `dude` and `water2`, so the array path
+/// is opt-in only above this size.
+const Z_ARRAY_MIN_NODES: usize = 4096;
+
 /// Arena of nodes backing the doubly linked list(s) used by the algorithm.
 struct Arena {
     nodes: Vec<Node>,
@@ -164,6 +175,40 @@ struct Arena {
     /// via `split_earcut`) calls to avoid a heap allocation each time.
     z_order_buf: Vec<(i32, u32)>,
     z_order_scratch: Vec<(i32, u32)>,
+
+    /// true while the contiguous z-order array (`z_entries`) is the live z-index for the
+    /// current `earcut_linked` call (see `Z_ARRAY_MIN_NODES`); false means `Node::prev_z`/
+    /// `next_z` are the live z-index instead. Toggled by `index_curve` on every call.
+    z_array_active: bool,
+    /// contiguous, z-sorted `(z, node, x, y, removed)` records built by `index_curve` once a
+    /// ring is large enough (see `Z_ARRAY_MIN_NODES`); scanned by `is_ear_hashed_array` instead
+    /// of chasing `prev_z`/`next_z` pointers through scattered `Node`s. `removed` is set once
+    /// the node at that position is clipped (mirrors the tombstone comment on `ZEntry` below),
+    /// so a rescan can skip it without touching `Node` memory at all.
+    z_entries: Vec<ZEntry>,
+    /// how many of `z_entries` are tombstoned (`removed == true`); `remove_node` compacts
+    /// `z_entries` (see `compact_z_array`) once this crosses half the array, so a long-running
+    /// triangulation with many holes/clips never has to scan runs of dead entries that grow
+    /// without bound — unlike the array, the `prev_z`/`next_z` linked list self-splices on
+    /// every removal, so this keeps the array's amortized scan cost comparable to it.
+    z_removed_count: usize,
+    /// maps a node's arena index (`offset / NODE_SIZE`) to its position in `z_entries`;
+    /// sized to `nodes.len()` as of the last `index_curve` call. Nodes created afterwards
+    /// (e.g. by `split_polygon`) have no entry and are never looked up here (guarded by a
+    /// bounds check wherever this is read).
+    z_pos_of_node: Vec<u32>,
+}
+
+/// one record in `Arena::z_entries`; see `Z_ARRAY_MIN_NODES` for why this exists alongside
+/// the `Node::prev_z`/`next_z` linked-list z-index. `removed` is a tombstone flag, set by
+/// `remove_node` once the node is clipped out of the ring.
+#[derive(Clone, Copy)]
+struct ZEntry {
+    z: i32,
+    node: u32,
+    x: f64,
+    y: f64,
+    removed: bool,
 }
 
 impl Arena {
@@ -178,6 +223,10 @@ impl Arena {
             index_active: false,
             z_order_buf: Vec::new(),
             z_order_scratch: Vec::new(),
+            z_array_active: false,
+            z_entries: Vec::new(),
+            z_removed_count: 0,
+            z_pos_of_node: Vec::new(),
         }
     }
 
@@ -190,6 +239,8 @@ impl Arena {
         self.filtered_out = false;
         self.num_blocks = 0;
         self.index_active = false;
+        self.z_array_active = false;
+        self.z_removed_count = 0;
     }
 
     /// `Node` is kept as small as possible (40 bytes, 8-byte aligned) so large rings fit more
@@ -274,16 +325,74 @@ impl Arena {
         self.get_mut(next).prev = prev;
         self.get_mut(prev).next = next;
 
-        if prev_z != NULL {
-            self.get_mut(prev_z).next_z = next_z;
-        }
-        if next_z != NULL {
-            self.get_mut(next_z).prev_z = prev_z;
+        if self.z_array_active {
+            let idx = Self::node_index(p);
+            if idx < self.z_pos_of_node.len() {
+                let pos = self.z_pos_of_node[idx] as usize;
+                if pos < self.z_entries.len() && !self.z_entries[pos].removed {
+                    self.z_entries[pos].removed = true;
+                    self.z_removed_count += 1;
+                    // amortized compaction: see the `z_removed_count` field comment
+                    if self.z_removed_count * 2 >= self.z_entries.len() {
+                        self.compact_z_array();
+                    }
+                }
+            }
+        } else {
+            if prev_z != NULL {
+                self.get_mut(prev_z).next_z = next_z;
+            }
+            if next_z != NULL {
+                self.get_mut(next_z).prev_z = prev_z;
+            }
         }
 
         // keep the hole-bridge index's block bboxes covering the healed prev->next edge
         if self.index_active {
             self.grow_block(prev, next);
+        }
+    }
+
+    /// a node handle's index into `nodes` (and the parallel `z_pos_of_node`)
+    #[inline(always)]
+    fn node_index(off: u32) -> usize {
+        off as usize / Self::NODE_SIZE
+    }
+
+    /// Drop tombstoned entries from `z_entries` (keeping the surviving ones in the same
+    /// relative, still-z-sorted order) and rebuild `z_pos_of_node` to match. Triggered by
+    /// `remove_node` once at least half of `z_entries` is dead, which bounds the amortized
+    /// cost of each removal to O(1) (each compaction of size k pays for the >= k/2 preceding
+    /// removals that triggered it) while keeping `is_ear_hashed_array`'s scan windows free of
+    /// long dead runs.
+    fn compact_z_array(&mut self) {
+        self.z_entries.retain(|e| !e.removed);
+        for (pos, e) in self.z_entries.iter().enumerate() {
+            self.z_pos_of_node[Self::node_index(e.node)] = pos as u32;
+        }
+        self.z_removed_count = 0;
+    }
+
+    /// Build the contiguous z-order array from `order` (already sorted by z, see
+    /// `index_curve`): one `ZEntry` per node, and a node-index -> position lookup so
+    /// `remove_node`/`is_ear_hashed_array` can find a given node's slot in O(1).
+    fn build_z_array(&mut self, order: &[(i32, u32)]) {
+        if self.z_pos_of_node.len() < self.nodes.len() {
+            self.z_pos_of_node.resize(self.nodes.len(), 0);
+        }
+        self.z_entries.clear();
+        self.z_entries.reserve(order.len());
+        self.z_removed_count = 0;
+        for (pos, &(z, node)) in order.iter().enumerate() {
+            let (x, y) = self.xy(node);
+            self.z_entries.push(ZEntry {
+                z,
+                node,
+                x,
+                y,
+                removed: false,
+            });
+            self.z_pos_of_node[Self::node_index(node)] = pos as u32;
         }
     }
 
@@ -671,9 +780,13 @@ fn earcut_linked<N: EarcutIndex>(
 
         if arena.area_at(prev, ex, ey, next) < 0.0
             && (if inv_size != 0.0 {
-                is_ear_hashed(
-                    arena, prev, next, prev_z, next_z, ex, ey, min_x, min_y, inv_size,
-                )
+                if arena.z_array_active {
+                    is_ear_hashed_array(arena, ear, prev, next, ex, ey, min_x, min_y, inv_size)
+                } else {
+                    is_ear_hashed(
+                        arena, prev, next, prev_z, next_z, ex, ey, min_x, min_y, inv_size,
+                    )
+                }
             } else {
                 is_ear(arena, ear)
             })
@@ -820,6 +933,99 @@ fn is_ear_hashed(
             return false;
         }
         n = nn.next_z;
+    }
+
+    true
+}
+
+/// array-backed counterpart of `is_ear_hashed`, used once a ring is large enough that
+/// `index_curve` built the contiguous `Arena::z_entries` z-index instead of threading
+/// `Node::prev_z`/`next_z` (see `Z_ARRAY_MIN_NODES`). Walks outward from `ear`'s own position
+/// in `z_entries`, which — being a flat, tightly packed array sorted by z — is far more
+/// cache-friendly to scan than chasing pointers through `Node`s scattered in ring-insertion
+/// order; the `removed` tombstone lets it skip clipped nodes without touching `Node` memory at
+/// all until a candidate actually passes the bbox/triangle checks below.
+#[allow(clippy::too_many_arguments)]
+fn is_ear_hashed_array(
+    arena: &Arena,
+    ear: u32,
+    a: u32,
+    c: u32,
+    bx: f64,
+    by: f64,
+    min_x: f64,
+    min_y: f64,
+    inv_size: f64,
+) -> bool {
+    let (ax, ay) = arena.xy(a);
+    let (cx, cy) = arena.xy(c);
+
+    let x0 = ax.min(bx).min(cx);
+    let y0 = ay.min(by).min(cy);
+    let x1 = ax.max(bx).max(cx);
+    let y1 = ay.max(by).max(cy);
+
+    let min_z = z_order(x0, y0, min_x, min_y, inv_size);
+    let max_z = z_order(x1, y1, min_x, min_y, inv_size);
+
+    let entries = &arena.z_entries;
+    let pos = arena.z_pos_of_node[Arena::node_index(ear)] as usize;
+
+    // scan left (previous in z order): entries at positions < pos
+    let mut i = pos;
+    while i > 0 {
+        i -= 1;
+        // Safety: `i < pos <= entries.len()` by construction, so `i` is in bounds.
+        let e = unsafe { *entries.get_unchecked(i) };
+        if e.z < min_z {
+            break;
+        }
+        if e.removed {
+            continue;
+        }
+        let (px, py) = (e.x, e.y);
+        if e.node != c
+            && px >= x0
+            && px <= x1
+            && py >= y0
+            && py <= y1
+            && !(ax == px && ay == py)
+            && point_in_triangle(ax, ay, bx, by, cx, cy, px, py)
+        {
+            let n = arena.get(e.node);
+            if arena.area_at(n.prev, px, py, n.next) >= 0.0 {
+                return false;
+            }
+        }
+    }
+
+    // scan right (next in z order): entries at positions > pos
+    let mut i = pos + 1;
+    while i < entries.len() {
+        // Safety: `i < entries.len()`, checked by the loop condition.
+        let e = unsafe { *entries.get_unchecked(i) };
+        if e.z > max_z {
+            break;
+        }
+        if e.removed {
+            i += 1;
+            continue;
+        }
+        let (px, py) = (e.x, e.y);
+        if e.node != c
+            && px >= x0
+            && px <= x1
+            && py >= y0
+            && py <= y1
+            && !(ax == px && ay == py)
+            && point_in_triangle(ax, ay, bx, by, cx, cy, px, py)
+        {
+            let n = arena.get(e.node);
+            if arena.area_at(n.prev, px, py, n.next) >= 0.0 {
+                return false;
+            }
+        }
+        i += 1;
     }
 
     true
@@ -1239,15 +1445,22 @@ fn index_curve(arena: &mut Arena, start: u32, min_x: f64, min_y: f64, inv_size: 
     let mut scratch = std::mem::take(&mut arena.z_order_scratch);
     sort_by_z(&mut order, &mut scratch);
 
-    let mut prev: u32 = NULL;
-    for &(_, node) in order.iter() {
-        arena.get_mut(node).prev_z = prev;
-        if prev != NULL {
-            arena.get_mut(prev).next_z = node;
+    // adaptive z-index representation: see `Z_ARRAY_MIN_NODES`
+    if order.len() >= Z_ARRAY_MIN_NODES {
+        arena.z_array_active = true;
+        arena.build_z_array(&order);
+    } else {
+        arena.z_array_active = false;
+        let mut prev: u32 = NULL;
+        for &(_, node) in order.iter() {
+            arena.get_mut(node).prev_z = prev;
+            if prev != NULL {
+                arena.get_mut(prev).next_z = node;
+            }
+            prev = node;
         }
-        prev = node;
+        arena.get_mut(prev).next_z = NULL;
     }
-    arena.get_mut(prev).next_z = NULL;
 
     arena.z_order_buf = order;
     arena.z_order_scratch = scratch;
@@ -1681,6 +1894,65 @@ mod tests {
 
             earcutter.earcut_into(&[], &[], 2, &mut out);
             assert!(out.is_empty());
+        }
+    }
+
+    /// a concave star-shaped ring with `points` outer vertices, used to exercise the
+    /// z-order-hashed ear clipping path at various sizes
+    fn star_ring(points: usize, outer_r: f64, inner_r: f64) -> Vec<f64> {
+        let n = points * 2;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let r = if i % 2 == 0 { outer_r } else { inner_r };
+            let theta = (i as f64) * std::f64::consts::TAU / (n as f64);
+            data.push(r * theta.cos());
+            data.push(r * theta.sin());
+        }
+        data
+    }
+
+    /// `index_curve` picks between the `Node::prev_z`/`next_z` linked-list z-index and the
+    /// contiguous `Arena::z_entries` array based on ring size (see `Z_ARRAY_MIN_NODES`).
+    /// Exercise both sides of that threshold (and comfortably below/above it) to make sure
+    /// switching representations never changes triangulation correctness.
+    #[test]
+    fn z_index_threshold_boundary_is_correct() {
+        for points in [
+            Z_ARRAY_MIN_NODES / 2,
+            Z_ARRAY_MIN_NODES / 2 - 1,
+            Z_ARRAY_MIN_NODES / 2 + 1,
+            Z_ARRAY_MIN_NODES / 2 + 8,
+            Z_ARRAY_MIN_NODES,
+        ] {
+            let data = star_ring(points, 100.0, 40.0);
+            let triangles: Vec<u32> = earcut(&data, &[], 2);
+            assert_eq!(triangles.len(), (points * 2 - 2) * 3, "points={points}");
+            assert!(
+                deviation(&data, &[], 2, &triangles) < 1e-9,
+                "points={points}"
+            );
+        }
+    }
+
+    /// same boundary check as above, but with a hole ring merged in, so the array-mode z-index
+    /// is built from a polygon that went through `eliminate_holes` (extra bridge nodes spliced
+    /// in) rather than a single untouched ring.
+    #[test]
+    fn z_index_threshold_boundary_with_hole_is_correct() {
+        for points in [Z_ARRAY_MIN_NODES / 2, Z_ARRAY_MIN_NODES] {
+            let mut data = star_ring(points, 100.0, 40.0);
+            let hole_index = data.len() / 2;
+            // a small square hole well inside the star, wound opposite to the outer ring
+            data.extend_from_slice(&[
+                -5.0, -5.0, -5.0, 5.0, 5.0, 5.0, 5.0, -5.0,
+            ]);
+            let hole_indices = [hole_index];
+            let triangles: Vec<u32> = earcut(&data, &hole_indices, 2);
+            assert!(!triangles.is_empty(), "points={points}");
+            assert!(
+                deviation(&data, &hole_indices, 2, &triangles) < 1e-9,
+                "points={points}"
+            );
         }
     }
 }
